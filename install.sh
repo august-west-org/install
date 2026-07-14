@@ -49,9 +49,16 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 1 — Docker Engine + Compose plugin (official convenience script)
+#   Skip the install entirely if Docker is already present — the get.docker.com
+#   convenience script otherwise prints a warning and sleeps 20s before doing a
+#   no-op reinstall.
 # ---------------------------------------------------------------------------
-curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-sh /tmp/get-docker.sh
+if docker --version >/dev/null 2>&1; then
+  echo "Docker already installed, skipping"
+else
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh
+fi
 systemctl enable --now docker
 docker --version
 docker compose version
@@ -100,6 +107,7 @@ gen NEXTCLOUD_DB_ROOT        _hex
 gen NEXTCLOUD_DB_PASSWORD    _hex
 gen NEXTCLOUD_ADMIN_PASSWORD _pw
 gen VW_ADMIN_TOKEN           _tok
+gen RESTIC_PASSWORD          _tok
 # authoritative, sourceable store consulted by future re-runs (values are
 # [A-Za-z0-9] only, so single-quoting is safe)
 cat > "$SECRETS" <<EOF
@@ -108,6 +116,7 @@ NEXTCLOUD_DB_ROOT='${NEXTCLOUD_DB_ROOT}'
 NEXTCLOUD_DB_PASSWORD='${NEXTCLOUD_DB_PASSWORD}'
 NEXTCLOUD_ADMIN_PASSWORD='${NEXTCLOUD_ADMIN_PASSWORD}'
 VW_ADMIN_TOKEN='${VW_ADMIN_TOKEN}'
+RESTIC_PASSWORD='${RESTIC_PASSWORD}'
 EOF
 chmod 600 "$SECRETS"
 cat > "$CRED" <<EOF
@@ -115,6 +124,7 @@ cat > "$CRED" <<EOF
 [Immich]        DB_PASSWORD=$IMMICH_DB_PASSWORD
 [Nextcloud]     MYSQL_ROOT_PASSWORD=$NEXTCLOUD_DB_ROOT  MYSQL_PASSWORD=$NEXTCLOUD_DB_PASSWORD  ADMIN_USER=admin  ADMIN_PASSWORD=$NEXTCLOUD_ADMIN_PASSWORD
 [Vaultwarden]   ADMIN_TOKEN=$VW_ADMIN_TOKEN
+[Restic]        RESTIC_PASSWORD=$RESTIC_PASSWORD  (B2 repo config in /etc/augustwest/backup.env)
 EOF
 chmod 600 "$CRED"
 
@@ -178,7 +188,9 @@ cd /root
 # ---------------------------------------------------------------------------
 # Step 5 — Nextcloud (files) -> 127.0.0.1:8080   [Nextcloud + MariaDB + Redis]
 # ---------------------------------------------------------------------------
-HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+# `|| true`: don't let a missing default route (pipefail) abort the install; an
+# empty HOST_IP just drops out of the trusted-domains list below.
+HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)
 cat > /opt/augustwest/nextcloud/docker-compose.yml <<EOF
 services:
   db:
@@ -265,8 +277,11 @@ unattended-upgrade --dry-run --debug   # sanity check
 #   Parameterize these (do NOT commit real tokens):
 #     CUSTOMER, DEVICE_NAME, PROVISION_TOKEN
 # ---------------------------------------------------------------------------
-: "${CUSTOMER:=test1}"
-: "${DEVICE_NAME:=server1}"
+# Required — no placeholder defaults, so a device can never register under a
+# throwaway identity if the operator forgets to set them. DEVICE_NAME defaults
+# to the host's own name, which is a sensible, unambiguous fallback.
+: "${CUSTOMER:?set CUSTOMER (August West customer slug)}"
+: "${DEVICE_NAME:=$(hostname)}"
 : "${PROVISION_TOKEN:?set PROVISION_TOKEN}"
 
 RESP=$(curl -sS -X POST https://provision.augustwest.org/provision \
@@ -274,8 +289,15 @@ RESP=$(curl -sS -X POST https://provision.augustwest.org/provision \
   -H "Content-Type: application/json" \
   -d "{\"customer\":\"${CUSTOMER}\",\"device_name\":\"${DEVICE_NAME}\",\"hostname\":\"$(hostname)\",\"os\":\"$(. /etc/os-release; echo "$PRETTY_NAME")\",\"arch\":\"$(dpkg --print-architecture)\",\"services\":[\"immich\",\"vaultwarden\",\"nextcloud\",\"homeassistant\"]}")
 echo "$RESP"
-PUSH_URL=$(echo "$RESP" | grep -o '"push_url":"[^"]*"' | sed 's/"push_url":"//;s/"$//')
-INTERVAL=$(echo "$RESP" | grep -o '"interval":[0-9]*' | grep -o '[0-9]*'); : "${INTERVAL:=60}"
+# `|| true` on each: grep exits 1 when a field is absent, and under
+# `set -euo pipefail` that would abort the install *before* the INTERVAL default
+# below could apply. Let them yield empty and fall back explicitly.
+PUSH_URL=$(echo "$RESP" | grep -o '"push_url":"[^"]*"' | sed 's/"push_url":"//;s/"$//' || true)
+INTERVAL=$(echo "$RESP" | grep -o '"interval":[0-9]*' | grep -o '[0-9]*' || true); : "${INTERVAL:=60}"
+if [ -z "$PUSH_URL" ]; then
+  echo "WARNING: provisioning response contained no push_url — heartbeat will have no target." >&2
+  echo "  Response was: $RESP" >&2
+fi
 
 install -d -m 700 /etc/augustwest
 umask 077
@@ -318,6 +340,100 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now augustwest-heartbeat.timer
+
+# ---------------------------------------------------------------------------
+# Step 8b — Restic backups of /opt/augustwest -> Backblaze B2, daily @ 03:00
+#   Encryption password: RESTIC_PASSWORD (generated in Step 2b, persisted in
+#   $SECRETS). Repository is Backblaze B2; its credentials must be supplied via
+#   the environment (B2_ACCOUNT_ID / B2_ACCOUNT_KEY / B2_BUCKET) or entered
+#   interactively below. If none are provided, backup config is SKIPPED with a
+#   warning — the rest of the install is unaffected.
+#
+#   Retention (applied after each backup): 7 daily, 4 weekly, 12 monthly.
+#   Runtime log: /var/log/augustwest-backup.log
+# ---------------------------------------------------------------------------
+: "${B2_ACCOUNT_ID:=}"
+: "${B2_ACCOUNT_KEY:=}"
+: "${B2_BUCKET:=}"
+
+# Prompt interactively for any missing value, but only if we have a TTY.
+if [ -t 0 ]; then
+  [ -n "$B2_ACCOUNT_ID" ]  || read -r -p 'Backblaze B2 account/key ID (blank to skip backups): ' B2_ACCOUNT_ID
+  if [ -n "$B2_ACCOUNT_ID" ]; then
+    [ -n "$B2_ACCOUNT_KEY" ] || read -r -s -p 'Backblaze B2 application key: ' B2_ACCOUNT_KEY; echo
+    [ -n "$B2_BUCKET" ]      || read -r -p 'Backblaze B2 bucket name: ' B2_BUCKET
+  fi
+fi
+
+if [ -z "$B2_ACCOUNT_ID" ] || [ -z "$B2_ACCOUNT_KEY" ] || [ -z "$B2_BUCKET" ]; then
+  echo "WARNING: B2 credentials not provided — backup is NOT configured." >&2
+  echo "         Re-run with B2_ACCOUNT_ID / B2_ACCOUNT_KEY / B2_BUCKET set to enable Restic backups." >&2
+else
+  # restic from the distro repo (Ubuntu 24.04+ ships a recent enough version)
+  if ! command -v restic >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y -qq restic
+  fi
+
+  # Backup environment consumed by the systemd unit and manual runs. Contains
+  # the B2 credentials + repo pointer + encryption password; keep it 600.
+  BACKUP_ENV=/etc/augustwest/backup.env
+  cat > "$BACKUP_ENV" <<EOF
+RESTIC_REPOSITORY='b2:${B2_BUCKET}:augustwest-$(hostname)'
+RESTIC_PASSWORD='${RESTIC_PASSWORD}'
+B2_ACCOUNT_ID='${B2_ACCOUNT_ID}'
+B2_ACCOUNT_KEY='${B2_ACCOUNT_KEY}'
+EOF
+  chmod 600 "$BACKUP_ENV"
+
+  # Initialize the repo once (idempotent: ignore "already initialized").
+  # shellcheck disable=SC1090
+  set -a; . "$BACKUP_ENV"; set +a
+  # Hard-fail if init fails when creds WERE provided: a bad credential should
+  # stop the install rather than leave a broken backup timer behind (set -e).
+  restic snapshots >/dev/null 2>&1 || restic init
+
+  # Backup runner: back up /opt/augustwest, prune to the retention policy, all
+  # output appended to the log with timestamps.
+  cat > /usr/local/bin/augustwest-backup.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+LOG=/var/log/augustwest-backup.log
+exec >>"$LOG" 2>&1
+echo "=== $(date -Is) augustwest backup start ==="
+set -a; . /etc/augustwest/backup.env; set +a
+restic backup /opt/augustwest --tag augustwest
+restic forget --prune --keep-daily 7 --keep-weekly 4 --keep-monthly 12
+echo "=== $(date -Is) augustwest backup done ==="
+SCRIPT
+  chmod 755 /usr/local/bin/augustwest-backup.sh
+  touch /var/log/augustwest-backup.log
+  chmod 600 /var/log/augustwest-backup.log
+
+  cat > /etc/systemd/system/augustwest-backup.service <<'EOF'
+[Unit]
+Description=August West Restic backup of /opt/augustwest to Backblaze B2
+After=network-online.target docker.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/augustwest-backup.sh
+EOF
+  cat > /etc/systemd/system/augustwest-backup.timer <<'EOF'
+[Unit]
+Description=Run August West Restic backup daily at 03:00
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+AccuracySec=1min
+Unit=augustwest-backup.service
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now augustwest-backup.timer
+  echo "Restic backups configured: daily @ 03:00 -> b2:${B2_BUCKET}:augustwest-$(hostname) (log: /var/log/augustwest-backup.log)"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 9 — see printed completion summary (service URLs + next steps)
