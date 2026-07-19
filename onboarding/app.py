@@ -107,46 +107,78 @@ async def create_account(body: AccountRequest):
     return {"status": "done", "result": outcome["result"]}
 
 
+# Public app-store landing pages for each companion app. These are plain links
+# to the vendors' own download pages (App Store / Google Play) and need NO
+# tunnel -- so the download QR codes ALWAYS render, even before the customer's
+# home is reachable on the internet. (Password Safe = Bitwarden client; Photo
+# Vault = Immich.)
+APP_DOWNLOAD_URLS = {
+    "immich": "https://immich.app",
+    "vaultwarden": "https://bitwarden.com/download",
+    "nextcloud": "https://nextcloud.com/install/#install-clients",
+    "homeassistant": "https://companion.home-assistant.io",
+}
+
+
 @app.get("/api/steps/qr", dependencies=[Depends(require_setup_token)])
 async def get_qr_bundle():
     from services.qr import make_qr_data_uri
 
     s = state_store.load()
-    bundle = {}
-
-    # Nextcloud (File Vault): real one-tap Login Flow v2 pairing.
-    flow = await nextcloud.start_login_flow()
-    bundle["nextcloud"] = {
-        "label": SERVICE_LABELS["nextcloud"],
-        "qr": make_qr_data_uri(flow["login_url"]),
-        "mode": "pairing",
-    }
     s["steps"]["qr"] = s["steps"].get("qr") or {}
-    s["steps"]["qr"]["pending_nextcloud_poll"] = {
-        "poll_token": flow["poll_token"],
-        "poll_endpoint": flow["poll_endpoint"],
-    }
+    tunnel_up = topology.tunnel_configured()
 
-    # Everything else: URL prefill only (companion apps still need one login,
-    # or -- for the Password Safe -- always will, by design).
-    for service in ("immich", "homeassistant", "vaultwarden"):
-        url = topology.public_url(service) or None
-        bundle[service] = {
-            "label": SERVICE_LABELS[service],
-            "qr": make_qr_data_uri(url) if url else None,
-            "mode": "prefill",
-            "available": url is not None,
+    # Every service gets an always-available app-download QR. The server-connect
+    # QR (which signs the app into the customer's home) is only meaningful once
+    # the phone can reach the home over the internet, so it is filled in below
+    # ONLY when the tunnel is configured.
+    services_out = {}
+    for key in ("nextcloud", "immich", "vaultwarden", "homeassistant"):
+        services_out[key] = {
+            "label": SERVICE_LABELS[key],
+            "download": {
+                "url": APP_DOWNLOAD_URLS[key],
+                "qr": make_qr_data_uri(APP_DOWNLOAD_URLS[key]),
+            },
+            "server_url": topology.public_url(key),
+            "connect": {"available": False, "qr": None, "url": None, "mode": None},
         }
 
-    bundle["apps"] = {
-        "label": "Get the apps",
-        "qr": make_qr_data_uri(f"{topology.setup_base_url()}/static/apps.html"),
-        "mode": "download",
-    }
+    if tunnel_up:
+        # Nextcloud: real one-tap Login Flow v2 pairing. Best-effort -- if the
+        # server isn't answering the flow yet, leave its connect QR unavailable
+        # rather than failing the whole phone step.
+        try:
+            flow = await nextcloud.start_login_flow()
+            services_out["nextcloud"]["connect"] = {
+                "available": True,
+                "qr": make_qr_data_uri(flow["login_url"]),
+                "url": flow["login_url"],
+                "mode": "pairing",
+            }
+            s["steps"]["qr"]["pending_nextcloud_poll"] = {
+                "poll_token": flow["poll_token"],
+                "poll_endpoint": flow["poll_endpoint"],
+            }
+        except Exception:  # noqa: BLE001 -- never block the phone step on this
+            logger.exception("qr: nextcloud login flow failed")
+
+        # Others: prefill the server URL so the companion app knows where to
+        # connect (it still asks for a one-time login -- always, for the
+        # Password Safe, by design).
+        for key in ("immich", "vaultwarden", "homeassistant"):
+            url = topology.public_url(key)
+            if url:
+                services_out[key]["connect"] = {
+                    "available": True,
+                    "qr": make_qr_data_uri(url),
+                    "url": url,
+                    "mode": "prefill",
+                }
 
     s["steps"]["qr"]["status"] = "pending"
     state_store.save(s)
-    return bundle
+    return {"tunnel_configured": tunnel_up, "services": services_out}
 
 
 @app.post("/api/steps/qr/check", dependencies=[Depends(require_setup_token)])

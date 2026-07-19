@@ -234,36 +234,101 @@ const SCREENS = {
   async qr() {
     card(`
       <h1>Set up your phone</h1>
-      <p class="sub">Scan to grab the apps and connect them to your home automatically.</p>
+      <p class="sub">Grab the apps now -- you can connect them to your home in a moment.</p>
       <div id="qr-body" class="center" style="padding:30px 0;"><span class="spinner"></span></div>
     `);
-    const bundle = await api("/api/steps/qr");
-    const tile = (key, name) => {
-      const item = bundle[key];
-      if (!item) return "";
-      const body = item.qr
-        ? `<img src="${item.qr}" alt="${name} QR code" />`
-        : `<div class="unavailable">Available once your home is connected to the internet</div>`;
-      return `<div class="qr-tile">${body}<div class="name">${name}</div></div>`;
-    };
+
+    // Fetch the QR bundle, but NEVER let a failure trap the customer here: the
+    // app-download codes and the Continue button must always work.
+    let bundle = null;
+    try {
+      bundle = await api("/api/steps/qr");
+    } catch (e) {
+      bundle = null;
+    }
+
+    const services = (bundle && bundle.services) || {};
+    const tunnelUp = !!(bundle && bundle.tunnel_configured);
+    const order = [
+      ["nextcloud", "File Vault"],
+      ["immich", "Photo Vault"],
+      ["vaultwarden", "Password Safe"],
+      ["homeassistant", "Smart Home"],
+    ];
+    const sectionTitle = (t) =>
+      `<div style="font-weight:600;font-size:1.05rem;margin:22px 0 8px;">${t}</div>`;
+
+    // --- App downloads: ALWAYS shown (plain App Store / Google Play links). ---
+    const downloadGrid = order
+      .map(([k, n]) => {
+        const item = services[k];
+        if (!item || !item.download || !item.download.qr) return "";
+        return `<div class="qr-tile">
+          <img src="${item.download.qr}" alt="${n} app download QR code" />
+          <div class="name">${n}</div>
+        </div>`;
+      })
+      .join("");
+
+    // --- Server connect: only when the home is reachable (tunnel configured). ---
+    let connectSection;
+    if (tunnelUp) {
+      const connectGrid = order
+        .map(([k, n]) => {
+          const item = services[k];
+          if (!item || !item.connect || !item.connect.available) return "";
+          const urlLine = item.server_url
+            ? `<div class="hint">${escapeHtml(item.server_url)}</div>`
+            : "";
+          return `<div class="qr-tile">
+            <img src="${item.connect.qr}" alt="${n} connect QR code" />
+            <div class="name">${n}</div>
+            ${urlLine}
+          </div>`;
+        })
+        .join("");
+      connectSection = `
+        ${sectionTitle("Connect your app")}
+        <p class="sub">Scan these to sign your apps into your home automatically.</p>
+        <div class="qr-grid">${connectGrid}</div>
+        <p class="hint">Scanning the File Vault code signs your phone in automatically.
+        The others may ask you to sign in with your August West login once -- for the
+        Password Safe, that's expected and by design: it's the one thing that should
+        always ask.</p>`;
+    } else {
+      connectSection = `
+        ${sectionTitle("You'll connect this later")}
+        <p class="sub">Download the apps now. You'll sign them into your home once your
+        secure internet connection is switched on.</p>
+        <p class="hint">When it's ready, reopen this setup page and scan the connect
+        codes -- or in each app choose "Add account" / "Log in to your server" and enter
+        your August West address and login. The Password Safe (Bitwarden) will always
+        ask for your master password, by design.</p>`;
+    }
+
     document.getElementById("qr-body").outerHTML = `
-      <div class="qr-grid">
-        ${tile("apps", "Get the apps")}
-        ${tile("nextcloud", "File Vault")}
-        ${tile("immich", "Photo Vault")}
-        ${tile("vaultwarden", "Password Safe")}
-        ${tile("homeassistant", "Smart Home")}
+      <div id="qr-body">
+        ${sectionTitle("Get the apps")}
+        <p class="sub">Scan to download each app from the App Store or Google Play.</p>
+        <div class="qr-grid">${
+          downloadGrid ||
+          '<div class="unavailable">App links are momentarily unavailable -- you can still continue and grab them later.</div>'
+        }</div>
+        <p class="hint">App Store listings show each app's real underlying name -- that's
+        normal, it's what quietly powers your setup behind the scenes.</p>
+        ${connectSection}
+        <button class="btn btn-primary" id="continue">Continue</button>
       </div>
-      <p class="hint">Scanning the File Vault code signs your phone in automatically.
-      The others may ask you to sign in with your August West login once -- for the
-      Password Safe, that's expected and by design: it's the one thing that should
-      always ask.</p>
-      <p class="hint">App Store listings show each app's real underlying name -- that's normal,
-      it's what quietly powers your setup behind the scenes.</p>
-      <button class="btn btn-primary" id="continue">Continue</button>
     `;
+
     document.getElementById("continue").onclick = async () => {
-      await api("/api/steps/qr/advance", { method: "POST" });
+      // Advancing is best-effort -- never trap the customer on this screen even
+      // if the tunnel (and thus server-side step state) isn't ready yet.
+      try {
+        await api("/api/steps/qr/advance", { method: "POST" });
+      } catch (e) {
+        /* proceed regardless */
+      }
       goto("icloud");
     };
   },
