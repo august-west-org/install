@@ -31,12 +31,17 @@ async def get_state():
 
 @app.post("/api/steps/health", dependencies=[Depends(require_setup_token)])
 async def run_health_check():
+    # Single, immediate probe -- returns right away so the request never blocks
+    # long enough to trip Cloudflare's proxy idle timeout. The frontend polls
+    # this endpoint every few seconds and advances on its own once `ready` is
+    # true. While the stack is still warming up we keep the step "pending" (not
+    # "done"), so a page reload mid-warmup resumes correctly on this screen.
     result = await check_health()
+    ready = all(r["ok"] for r in result.values())
     s = state_store.load()
-    all_ok = all(r["ok"] for r in result.values())
-    s["steps"]["health"] = {"status": "done" if all_ok else "degraded", "result": result}
+    s["steps"]["health"] = {"status": "done" if ready else "pending", "result": result}
     state_store.save(s)
-    return s["steps"]["health"]
+    return {"ready": ready, "status": s["steps"]["health"]["status"], "result": result}
 
 
 class AccountRequest(BaseModel):

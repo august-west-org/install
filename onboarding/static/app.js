@@ -92,16 +92,60 @@ const SCREENS = {
       <p class="sub">Making sure everything is up and running before we begin.</p>
       <div id="health-body" class="center" style="padding:30px 0;"><span class="spinner"></span> Checking...</div>
     `);
-    const result = await api("/api/steps/health", { method: "POST" });
-    const rows = Object.entries(result.result || {}).map(([key, r]) => {
-      const pill = r.ok
-        ? '<span class="status-pill ok">Ready</span>'
-        : '<span class="status-pill bad">Not ready</span>';
-      return `<div class="service-row"><span class="name">${r.label}</span>${pill}</div>`;
-    }).join("");
-    document.getElementById("health-body").outerHTML = `<div>${rows}</div>
-      <button class="btn btn-primary" id="continue">Continue</button>`;
-    document.getElementById("continue").onclick = () => goto("account");
+
+    // Services can take a while to boot after install. Rather than hold one long
+    // request open (which Cloudflare's proxy may cut off), poll this quick
+    // endpoint every few seconds until every service reports healthy, then
+    // advance automatically. Each poll is an independent, fast request.
+    const POLL_MS = 5000;
+
+    const serviceRows = (result) =>
+      Object.values(result || {})
+        .map((r) => {
+          const pill = r.ok
+            ? '<span class="status-pill ok">Ready</span>'
+            : '<span class="status-pill bad">Starting...</span>';
+          return `<div class="service-row"><span class="name">${r.label}</span>${pill}</div>`;
+        })
+        .join("");
+
+    const setBody = (html) => {
+      const body = document.getElementById("health-body");
+      if (body) body.outerHTML = `<div id="health-body">${html}</div>`;
+    };
+
+    const poll = async () => {
+      // Stop polling if the customer has navigated away from this screen.
+      if (currentStep !== "health") return;
+
+      let data;
+      try {
+        data = await api("/api/steps/health", { method: "POST" });
+      } catch (e) {
+        // Transient error while things come up -- reassure and keep trying.
+        setBody(
+          '<div class="center" style="padding:20px 0;"><span class="spinner"></span> ' +
+            "Still warming up... checking again shortly</div>"
+        );
+        setTimeout(poll, POLL_MS);
+        return;
+      }
+
+      if (data.ready) {
+        // Everything is healthy -- proceed automatically.
+        goto("account");
+        return;
+      }
+
+      setBody(
+        serviceRows(data.result) +
+          '<div class="center" style="padding:16px 0;"><span class="spinner"></span> ' +
+          "Still warming up... checking again shortly</div>"
+      );
+      setTimeout(poll, POLL_MS);
+    };
+
+    poll();
   },
 
   async account() {
