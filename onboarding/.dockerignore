@@ -1,0 +1,23 @@
+# Keep the build context (and image) small and free of host-specific state.
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# The Vaultwarden browser-automation scratch dir: node_modules, screenshots,
+# and one-off debug scripts. The wizard uses the Python playwright bundled in
+# the base image, not this.
+vw-automation/
+
+# Host-generated runtime state -- provided via volumes at runtime instead.
+state.json
+.state-*.tmp
+.devcert/
+
+# Ad-hoc debug helpers.
+debug_vw*.py
+
+# Container definition itself.
+Dockerfile
+.dockerignore
+docker-compose.yml

@@ -1,8 +1,11 @@
-name: augustwest-onboarding
-
-# The onboarding wizard. Uses host networking so it can reach the local
-# services (Immich, Vaultwarden, Nextcloud, Home Assistant) on 127.0.0.1,
-# while binding its own UI to 127.0.0.1:8888 only — never the public network.
+# August West onboarding wizard -- containerized.
+#
+# NETWORK MODEL: network_mode: host is deliberate. Every backing service
+# (Immich 2283, Vaultwarden 8443, Nextcloud 8080, Home Assistant 8123) is
+# published on 127.0.0.1 only, and the wizard addresses each at
+# http://127.0.0.1:<port> (services/*.py). Host networking lets that keep
+# working unchanged and keeps the wizard itself on the host's loopback (:8888),
+# which is exactly what the Cloudflare Tunnel's setup.<domain> route connects to.
 services:
   onboarding:
     build: .
@@ -10,9 +13,9 @@ services:
     container_name: augustwest_onboarding
     restart: unless-stopped
     network_mode: host
-    env_file:
-      - .env
-    environment:
-      AW_DATA_DIR: /data
     volumes:
-      - ./data:/data
+      # Secrets (secrets.env) and the setup token live here; the token is
+      # created on first run if absent, so this must be writable.
+      - /etc/augustwest:/etc/augustwest
+      # The host stack dir: persists state.json under onboarding/.
+      - /opt/augustwest:/opt/augustwest
