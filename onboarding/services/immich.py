@@ -19,11 +19,28 @@ async def create_account(email: str, password: str, name: str) -> dict:
         if resp.status_code in (200, 201):
             return {"ok": True, "email": email, "role": "admin"}
 
+        # admin-sign-up was refused. The overwhelmingly common reason on a
+        # wizard re-run is "the server already has an admin" -- so fall back to
+        # logging in with the SAME credentials the customer just entered. If
+        # that works the account is effectively provisioned (idempotent success);
+        # if it fails, the existing account has a different password, which we
+        # report in plain English rather than echoing Immich's raw error.
         login_resp = await client.post(
             f"{BASE}/api/auth/login", json={"email": email, "password": password}
         )
         if login_resp.status_code in (200, 201):
             return {"ok": True, "email": email, "role": "admin", "already_existed": True}
+
+        if resp.status_code == 400 and "admin" in resp.text.lower():
+            return {
+                "ok": False,
+                "email": email,
+                "error": (
+                    "Your Photo Vault already has an account, but the password "
+                    "provided doesn't match it. Please use your original Photo "
+                    "Vault password."
+                ),
+            }
         return {"ok": False, "error": resp.text}
 
 

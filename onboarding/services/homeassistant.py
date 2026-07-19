@@ -95,7 +95,22 @@ async def create_owner(username: str, password: str, name: str) -> dict:
     status = await onboarding_status()
     user_step = next((s for s in status if s["step"] == "user"), None)
     if user_step and user_step["done"]:
+        # Wizard re-run: the owner already exists. Authenticate with the exact
+        # credentials the customer just entered (NOT any stored/previous token)
+        # to obtain a fresh access/refresh token pair. If those credentials work
+        # this is an idempotent success; if they don't, the existing account has
+        # a different password and we say so in plain English.
         result = await login(username, password)
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "already_existed": True,
+                "error": (
+                    "Your Smart Home is already set up, but the password provided "
+                    "doesn't match the existing account. Please use your original "
+                    "Smart Home password."
+                ),
+            }
         result["already_existed"] = True
         return result
 

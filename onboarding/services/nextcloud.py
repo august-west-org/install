@@ -27,9 +27,36 @@ async def create_user(username: str, password: str, email: str, display_name: st
         meta = data.get("ocs", {}).get("meta", {})
         if meta.get("statuscode") in (100, 200):
             return {"ok": True, "username": username}
-        if "already exists" in meta.get("message", "").lower():
+        message = meta.get("message", "unknown error")
+        low = message.lower()
+        if "already exists" in low:
             return {"ok": True, "username": username, "already_existed": True}
-        return {"ok": False, "error": meta.get("message", "unknown error")}
+        # Nextcloud's password_policy app rejects weak passwords with a message
+        # whose wording varies by version ("...among the 1,000,000 most common
+        # passwords", "...at least 10 characters", "...present in a compromised
+        # password list", etc.). Detect that family of errors and surface one
+        # clear, plain-English instruction instead of the raw policy text.
+        if "password" in low and any(
+            kw in low
+            for kw in (
+                "common",
+                "least",
+                "character",
+                "compromised",
+                "policy",
+                "short",
+                "weak",
+                "insecure",
+            )
+        ):
+            return {
+                "ok": False,
+                "error": (
+                    "Your password needs to be at least 10 characters and can't "
+                    "be a common password. Please choose a stronger password."
+                ),
+            }
+        return {"ok": False, "error": message}
 
 
 async def start_login_flow() -> dict:
