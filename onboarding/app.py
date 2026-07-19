@@ -1,5 +1,7 @@
+import logging
+
 import topology
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -10,12 +12,40 @@ from security import require_setup_token
 from services import nextcloud, vaultwarden
 from services.common import SERVICE_LABELS, check_health
 
+# Configure logging once at import. basicConfig is a no-op if the root logger is
+# already configured (e.g. by a custom uvicorn log config), so this only adds a
+# stderr handler when nothing else has -- guaranteeing our provisioning error
+# logs are actually emitted to the container logs.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("august_west.wizard")
+
 app = FastAPI(title="August West Setup")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def _public_state(s: dict) -> dict:
     return {k: v for k, v in s.items() if k != "_internal"}
+
+
+def _account_failure(email: str, context: str, result: dict) -> HTTPException:
+    """Build the 502 raised when one or more services fail to create an account.
+    Logs which services failed (with their error detail) and returns an
+    HTTPException whose body carries the per-service result so the wizard can
+    show the customer exactly what went wrong -- never a silent 200."""
+    failed = [name for name, r in result.items() if not r.get("ok")]
+    logger.error("%s FAILED for %s; failed services=%s; detail=%s", context, email, failed, result)
+    return HTTPException(
+        status_code=502,
+        detail={
+            "status": "error",
+            "message": "Some services could not be set up: " + ", ".join(failed),
+            "failed": failed,
+            "result": result,
+        },
+    )
 
 
 @app.get("/")
@@ -65,8 +95,16 @@ async def create_account(body: AccountRequest):
     }
     s["quick_access"] = outcome["quick_access"]
     s["_internal"] = outcome["internal"]
+    # Persist the (possibly partial) result before deciding the response, so the
+    # error detail is available for a later retry/resume.
     state_store.save(s)
-    return {"status": s["steps"]["account"]["status"], "result": outcome["result"]}
+
+    if not outcome["ok"]:
+        # Real REST semantics: creation failed, so do NOT return 200. The 502
+        # carries the per-service detail and is logged in _account_failure.
+        raise _account_failure(body.email, "account creation", outcome["result"])
+
+    return {"status": "done", "result": outcome["result"]}
 
 
 @app.get("/api/steps/qr", dependencies=[Depends(require_setup_token)])
@@ -164,6 +202,12 @@ async def add_family_member(body: FamilyMemberRequest):
         "username": outcome["username"],
         "result": outcome["result"],
     }
+
+    if not outcome["ok"]:
+        # Same as the primary account: a failed family member must not report
+        # success. Don't record the member or mark the step done.
+        raise _account_failure(body.email, "family member creation", outcome["result"])
+
     s["steps"]["family"]["members"].append(member_record)
     s["steps"]["family"]["status"] = "done"
     state_store.save(s)

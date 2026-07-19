@@ -25,8 +25,23 @@ async function api(path, opts) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   if (!resp.ok) {
-    const detail = await resp.text();
-    throw new Error(detail || `HTTP ${resp.status}`);
+    // Surface a friendly message from a structured error body when present
+    // (FastAPI wraps HTTPException detail under `detail`), else fall back to the
+    // raw text / status code.
+    let message = `HTTP ${resp.status}`;
+    const raw = await resp.text();
+    if (raw) {
+      message = raw;
+      try {
+        const parsed = JSON.parse(raw);
+        const d = parsed.detail !== undefined ? parsed.detail : parsed;
+        if (d && typeof d === "object" && d.message) message = d.message;
+        else if (typeof d === "string") message = d;
+      } catch (_) {
+        /* not JSON -- keep raw text */
+      }
+    }
+    throw new Error(message);
   }
   return resp.json();
 }
