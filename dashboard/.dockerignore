@@ -1,0 +1,16 @@
+# Keep the build context (and image) small and host-state-free.
+__pycache__/
+**/__pycache__/
+*.pyc
+venv/
+
+# Host-generated runtime state -- provided via volumes at runtime instead.
+sessions.json
+*.tmp
+
+# Not needed inside the image.
+Dockerfile
+.dockerignore
+docker-compose.yml
+host/
+README.md

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# August West tunnel control -- host side.
+#
+# Bridges the loopback dashboard container (which must NOT hold host root or
+# systemd access) to the real aw-cloudflared.service. The container only writes
+# a one-word intent to $DESIRED; this script (driven by systemd path/timer
+# units) applies it and records the observed state in $STATE for the dashboard
+# to read back.
+set -euo pipefail
+
+SERVICE=aw-cloudflared.service
+SPOOL=/etc/augustwest/tunnel
+DESIRED="$SPOOL/desired"
+STATE="$SPOOL/state"
+
+mkdir -p "$SPOOL"
+
+write_state() {
+  if systemctl is-active --quiet "$SERVICE"; then
+    echo up > "$STATE"
+  else
+    echo down > "$STATE"
+  fi
+  chmod 644 "$STATE" 2>/dev/null || true
+}
+
+case "${1:-}" in
+  apply)
+    want="$(cat "$DESIRED" 2>/dev/null || echo up)"
+    if [ "$want" = down ]; then
+      systemctl stop "$SERVICE" || true
+    else
+      systemctl start "$SERVICE" || true
+    fi
+    write_state
+    ;;
+  refresh)
+    write_state
+    ;;
+  *)
+    echo "usage: aw-tunnel-ctl {apply|refresh}" >&2
+    exit 2
+    ;;
+esac

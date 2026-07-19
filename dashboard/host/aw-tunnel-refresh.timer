@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically publish the August West tunnel state for the dashboard
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=30
+AccuracySec=5s
+Unit=aw-tunnel-refresh.service
+
+[Install]
+WantedBy=timers.target

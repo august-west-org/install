@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh the observed August West tunnel state file
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aw-tunnel-ctl refresh

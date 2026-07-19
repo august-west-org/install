@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for August West tunnel desired-state changes
+
+[Path]
+# The dashboard container writes "up"/"down" here; fire the apply service on change.
+PathModified=/etc/augustwest/tunnel/desired
+Unit=aw-tunnel-apply.service
+
+[Install]
+WantedBy=paths.target

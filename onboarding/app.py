@@ -1,5 +1,6 @@
 import logging
 
+import dashboard_auth
 import topology
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -103,6 +104,14 @@ async def create_account(body: AccountRequest):
         # Real REST semantics: creation failed, so do NOT return 200. The 502
         # carries the per-service detail and is logged in _account_failure.
         raise _account_failure(body.email, "account creation", outcome["result"])
+
+    # Persist a verifier for the master password so the customer's home-screen
+    # dashboard app can authenticate with the same password. Best-effort: never
+    # let this break a successful account creation.
+    try:
+        dashboard_auth.write_master_password_hash(body.password)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not write dashboard master-password verifier")
 
     return {"status": "done", "result": outcome["result"]}
 

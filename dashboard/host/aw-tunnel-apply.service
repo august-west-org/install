@@ -1,0 +1,7 @@
+[Unit]
+Description=Apply August West tunnel desired state (start/stop aw-cloudflared)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aw-tunnel-ctl apply

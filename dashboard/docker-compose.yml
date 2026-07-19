@@ -1,0 +1,28 @@
+# August West customer dashboard -- containerized.
+#
+# NETWORK MODEL: network_mode: host is deliberate, exactly as the onboarding
+# wizard. The dashboard binds 127.0.0.1:8889 and the Cloudflare Tunnel's
+# dashboard-<customer_domain> route connects to it; the service health checks
+# hit the other apps on 127.0.0.1 (2283/8443/8080/8123).
+#
+# TUNNEL CONTROL: the dashboard NEVER gets host root/systemd. It only writes a
+# one-word intent to /etc/augustwest/tunnel/desired; the host-side units in
+# host/ (install with host/install.sh) apply it with real systemctl and write
+# the observed state back to /etc/augustwest/tunnel/state.
+services:
+  dashboard:
+    build: .
+    image: augustwest/dashboard:latest
+    container_name: augustwest_dashboard
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # Force the shared-file spool backend -- this container has no systemctl.
+      AW_TUNNEL_MODE: spool
+    volumes:
+      # Master-password hash (dashboard_auth.json) + tunnel spool live here.
+      - /etc/augustwest:/etc/augustwest
+      # Persists sessions.json under dashboard/.
+      - /opt/augustwest:/opt/augustwest
+      # Read-only: to compute "last backup X hours ago" from the backup log.
+      - /var/log:/var/log:ro
