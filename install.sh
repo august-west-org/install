@@ -60,6 +60,11 @@ run_quiet() {
   fi
 }
 
+# Reinstall/idempotency helper: is a service already answering its health check?
+# Used to skip re-provisioning a service that is already up and healthy, so this
+# script can be re-run on the same host cleanly (see Steps 3-6).
+service_up() { curl -fsS -o /dev/null --max-time 5 "$1" 2>/dev/null; }
+
 echo
 echo "  Welcome to August West — setting up your private home cloud."
 echo "  This takes a few minutes. You can leave it running."
@@ -95,6 +100,9 @@ if ! swapon --show | grep -q /swapfile; then
   run_quiet swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
   run_quiet sysctl -w vm.swappiness=10
+  # /etc/sysctl.conf is absent on minimal Ubuntu images — create it before we
+  # grep/append so the read doesn't error and the setting still persists.
+  [ -f /etc/sysctl.conf ] || touch /etc/sysctl.conf
   grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
 fi
 ok "Device prepared."
@@ -190,37 +198,85 @@ ok "Security keys generated."
 # Step 3 — Immich (photos) -> 127.0.0.1:2283
 # ---------------------------------------------------------------------------
 say "Setting up your Photo Vault... (this can take a couple of minutes)"
-cd /opt/augustwest/immich
-run_quiet curl -fsSL -o docker-compose.yml https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml
-run_quiet curl -fsSL -o .env         https://github.com/immich-app/immich/releases/latest/download/example.env
-sed -i "s|- '2283:2283'|- '127.0.0.1:2283:2283'|" docker-compose.yml   # loopback only
-sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${IMMICH_DB_PASSWORD}|" .env
-grep -q '^TZ=' .env && sed -i "s|^TZ=.*|TZ=$(cat /etc/timezone 2>/dev/null||echo Etc/UTC)|" .env
-run_quiet docker compose pull -q
-run_quiet docker compose up -d
+if service_up http://127.0.0.1:2283/api/server/ping; then
+  # Reinstall safety: already up and answering -> leave it (and its data) alone.
+  note "Photo Vault already running and healthy — skipping."
+else
+  cd /opt/augustwest/immich
 
-# Guard: Postgres bakes its password in at first init only (see Step 2b). On a
-# fresh host ./postgres is empty and inits with DB_PASSWORD above. If a leftover
-# cluster is present whose password differs (e.g. a stale ./postgres whose secret
-# was lost), assert it now with a clear remedy instead of leaving a crash-loop.
-if [ -f postgres/PG_VERSION ]; then
-  for _ in $(seq 1 30); do docker exec immich_postgres pg_isready -q 2>/dev/null && break; sleep 2; done
-  if ! docker exec -e PGPASSWORD="${IMMICH_DB_PASSWORD}" immich_postgres \
-         psql -h 127.0.0.1 -U postgres -d immich -tAc 'select 1' >/dev/null 2>&1; then
-    cat >&2 <<MSG
-FATAL: Immich Postgres rejects the configured DB_PASSWORD.
-  The existing cluster in $(pwd)/postgres was initialized with a different password.
-  If it holds no data you need:   docker compose down && rm -rf postgres && docker compose up -d
-  To keep the data, align the cluster password to the one in .env:
-    docker exec -i immich_postgres psql -U postgres \\
-      -c "ALTER USER postgres PASSWORD '${IMMICH_DB_PASSWORD}';"
-MSG
-    exit 1
+  # --- Reinstall safety for the Postgres bind-mount (./postgres) -------------
+  # Postgres bakes its superuser password in at FIRST init only and thereafter
+  # IGNORES DB_PASSWORD; a leftover ./postgres cluster from a previous run whose
+  # password no longer matches .env would otherwise leave immich_server crash-
+  # looping on "password authentication failed for user postgres". Resolve it
+  # automatically so a second run on the same host always converges cleanly:
+  #   - partial / uninitialized dir  -> remove it now, reinit fresh below
+  #   - initialized, NO real data    -> remove it, reinit cleanly (after start)
+  #   - initialized WITH real data   -> keep the photos, align password to .env
+  PG_DIR=/opt/augustwest/immich/postgres
+  PG_PREEXISTING=false
+  if [ -e "$PG_DIR" ]; then
+    if [ -f "$PG_DIR/PG_VERSION" ]; then
+      PG_PREEXISTING=true            # a real, initialized cluster — inspect after start
+    else
+      note "Clearing an incomplete photo database from a previous attempt..."
+      rm -rf "$PG_DIR"               # partial/empty dir: nothing worth preserving
+    fi
   fi
+
+  run_quiet curl -fsSL -o docker-compose.yml https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml
+  run_quiet curl -fsSL -o .env         https://github.com/immich-app/immich/releases/latest/download/example.env
+  sed -i "s|- '2283:2283'|- '127.0.0.1:2283:2283'|" docker-compose.yml   # loopback only
+  sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${IMMICH_DB_PASSWORD}|" .env
+  grep -q '^TZ=' .env && sed -i "s|^TZ=.*|TZ=$(cat /etc/timezone 2>/dev/null||echo Etc/UTC)|" .env
+  run_quiet docker compose pull -q
+  run_quiet docker compose up -d
+
+  # If we brought a pre-existing cluster back up, reconcile its password with
+  # .env. The Postgres container itself starts fine regardless of the mismatch
+  # (it uses whatever is baked on disk), so it is available to inspect/repair.
+  if [ "$PG_PREEXISTING" = true ]; then
+    for _ in $(seq 1 30); do docker exec immich_postgres pg_isready -q 2>/dev/null && break; sleep 2; done
+
+    if docker exec -e PGPASSWORD="${IMMICH_DB_PASSWORD}" immich_postgres \
+         psql -h 127.0.0.1 -U postgres -d immich -tAc 'select 1' >/dev/null 2>&1; then
+      : # configured password already works — cluster is consistent with .env
+    else
+      # Password mismatch. Decide by whether the cluster holds real photo data.
+      # Local unix-socket superuser access uses trust auth, so we can inspect and
+      # repair WITHOUT knowing the old password.
+      has_data=false
+      assets=$(docker exec immich_postgres psql -U postgres -d immich -tAc \
+                 "SELECT count(*) FROM assets" 2>/dev/null | tr -dc '0-9')
+      if [ -n "$assets" ]; then
+        [ "$assets" -gt 0 ] && has_data=true
+      else
+        # assets table absent (schema differs / never fully initialized): fall
+        # back to whether the immich DB has ANY user tables. If it does, preserve
+        # to be safe; a completely empty DB is safe to discard.
+        ntables=$(docker exec immich_postgres psql -U postgres -d immich -tAc \
+          "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null | tr -dc '0-9')
+        [ -n "$ntables" ] && [ "$ntables" -gt 0 ] && has_data=true
+      fi
+
+      if [ "$has_data" = true ]; then
+        note "Existing photo library detected — keeping your photos and re-aligning"
+        note "the database password automatically (no data will be lost)."
+        docker exec -i immich_postgres psql -U postgres \
+          -c "ALTER USER postgres PASSWORD '${IMMICH_DB_PASSWORD}';" >> "$LOG" 2>&1
+        run_quiet docker compose restart
+      else
+        note "Found an old, empty photo database — clearing it for a clean setup."
+        run_quiet docker compose down
+        rm -rf "$PG_DIR"
+        run_quiet docker compose up -d
+      fi
+    fi
+  fi
+  # health: curl http://127.0.0.1:2283/api/server/ping  -> {"res":"pong"}
+  cd /root
 fi
-# health: curl http://127.0.0.1:2283/api/server/ping  -> {"res":"pong"}
 ok "Photo Vault ready."
-cd /root
 
 # ---------------------------------------------------------------------------
 # Step 4 — Vaultwarden (passwords) -> 127.0.0.1:8443
@@ -228,6 +284,9 @@ cd /root
 #   tunnel URL once known. SIGNUPS_ALLOWED=true for onboarding -> flip to false.
 # ---------------------------------------------------------------------------
 say "Setting up your Password Manager..."
+if service_up http://127.0.0.1:8443/alive; then
+  note "Password Manager already running and healthy — skipping."
+else
 cat > /opt/augustwest/vaultwarden/docker-compose.yml <<EOF
 services:
   vaultwarden:
@@ -244,14 +303,21 @@ services:
       - "127.0.0.1:8443:80"
 EOF
 cd /opt/augustwest/vaultwarden && run_quiet docker compose pull -q && run_quiet docker compose up -d
+cd /root
+fi
 # health: curl http://127.0.0.1:8443/alive  -> ISO timestamp
 ok "Password Manager ready."
-cd /root
 
 # ---------------------------------------------------------------------------
 # Step 5 — Nextcloud (files) -> 127.0.0.1:8080   [Nextcloud + MariaDB + Redis]
 # ---------------------------------------------------------------------------
 say "Setting up your File Cloud..."
+# Reinstall safety: skip if Nextcloud is already installed and healthy. status.php
+# reports {"installed":true,...} only once first-run setup has completed, so this
+# guard is true only for a genuinely ready instance (not one mid-initialization).
+if curl -fsS --max-time 5 http://127.0.0.1:8080/status.php 2>/dev/null | grep -q '"installed":true'; then
+  note "File Cloud already running and healthy — skipping."
+else
 # `|| true`: don't let a missing default route (pipefail) abort the install; an
 # empty HOST_IP just drops out of the trusted-domains list below.
 HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)
@@ -306,8 +372,9 @@ for _ in $(seq 1 60); do
 done
 run_quiet docker exec -u www-data nextcloud_app php occ config:system:set \
   trusted_domains 2 --value="files-${CUSTOMER}.augustwest.org"
-ok "File Cloud ready."
 cd /root
+fi
+ok "File Cloud ready."
 
 # ---------------------------------------------------------------------------
 # Step 6 — Home Assistant (smart home) -> 127.0.0.1:8123
@@ -315,6 +382,9 @@ cd /root
 #   auto-discovery switch to network_mode: host later.
 # ---------------------------------------------------------------------------
 say "Setting up your Smart Home hub..."
+if service_up http://127.0.0.1:8123/manifest.json; then
+  note "Smart Home hub already running and healthy — skipping."
+else
 cat > /opt/augustwest/homeassistant/docker-compose.yml <<EOF
 services:
   homeassistant:
@@ -354,9 +424,10 @@ http:
     - 172.16.0.0/12
 EOF
 cd /opt/augustwest/homeassistant && run_quiet docker compose pull -q && run_quiet docker compose up -d
+cd /root
+fi
 # health: curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8123/  -> 302
 ok "Smart Home hub ready."
-cd /root
 
 # ---------------------------------------------------------------------------
 # Step 6a — onboarding wizard (August West setup UI) -> 127.0.0.1:8888
