@@ -79,6 +79,18 @@ def current_state() -> str:
     return _direct_state() if _mode() == "direct" else _spool_state()
 
 
+def read_state_file() -> str:
+    """Observed tunnel state straight from the spool file (STATE_PATH), normalized
+    to exactly UP or DOWN.
+
+    This is the poll target for the phone UI: the host-side apply unit writes
+    "up"/"down" to /etc/augustwest/tunnel/state, and we report it verbatim. Only a
+    clean "down" reads as DOWN; a missing/empty/unknown file reads as UP, matching
+    the fail-visible rule used elsewhere (never show a false "dark").
+    """
+    return DOWN if _spool_state() == DOWN else UP
+
+
 def set_online(up: bool) -> None:
     if _mode() == "direct":
         _direct_set(up)

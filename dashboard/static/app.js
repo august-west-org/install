@@ -16,6 +16,15 @@ const LINK_PREFIX = {
 
 let token = localStorage.getItem(TOKEN_KEY);
 
+// Authoritative online/offline state, driven by the 5s /api/tunnel/state poll.
+// When the tunnel is down the home is dark: the toggle reads off, the dark
+// banner shows, and EVERY service tile reads Offline (they're only reachable
+// through the tunnel, even though their loopback health checks still pass).
+let tunnelOnline = true;
+// Last /api/status payload (services + backup), so a tunnel-state flip can
+// repaint without waiting for the slower status poll.
+let lastStatus = null;
+
 function el(id) { return document.getElementById(id); }
 function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML; }
 
@@ -107,16 +116,22 @@ function backupText(backup) {
 }
 
 function renderDashboard(status) {
-  const online = status ? status.online : true;
+  if (status) lastStatus = status;
+  status = status || lastStatus;
+  // The tunnel poll is the single source of truth for online/offline.
+  const online = tunnelOnline;
   const services = (status && status.services) || [];
   const controlAvailable = status ? status.control_available : true;
 
   const svcRows = services
     .map(
-      (s) => `<div class="svc-row">
+      (s) => {
+        const svcOnline = online && s.online; // dark tunnel => every tile Offline
+        return `<div class="svc-row">
         <span class="name">${escapeHtml(s.label)}</span>
-        <span class="pill ${s.online ? "online" : "offline"}"><span class="dot"></span>${s.online ? "Online" : "Offline"}</span>
-      </div>`
+        <span class="pill ${svcOnline ? "online" : "offline"}"><span class="dot"></span>${svcOnline ? "Online" : "Offline"}</span>
+      </div>`;
+      }
     )
     .join("");
 
@@ -181,6 +196,7 @@ function renderDashboard(status) {
 
   // Refresh live data.
   refreshStatus();
+  pollTunnelState();
 }
 
 async function refreshStatus() {
@@ -196,7 +212,9 @@ async function refreshStatus() {
 
 // Update the already-rendered dashboard in place (avoids flicker / re-binding).
 function paintStatus(status) {
-  const online = status.online;
+  lastStatus = status;
+  // online/offline is owned by the tunnel poll, not the per-service status.
+  const online = tunnelOnline;
   const headline = el("toggle-headline");
   const sw = el("switch");
   if (headline) {
@@ -214,8 +232,11 @@ function paintStatus(status) {
   if (list && status.services) {
     list.innerHTML = status.services
       .map(
-        (s) => `<div class="svc-row"><span class="name">${escapeHtml(s.label)}</span>
-          <span class="pill ${s.online ? "online" : "offline"}"><span class="dot"></span>${s.online ? "Online" : "Offline"}</span></div>`
+        (s) => {
+          const svcOnline = online && s.online; // dark tunnel => every tile Offline
+          return `<div class="svc-row"><span class="name">${escapeHtml(s.label)}</span>
+          <span class="pill ${svcOnline ? "online" : "offline"}"><span class="dot"></span>${svcOnline ? "Online" : "Offline"}</span></div>`;
+        }
       )
       .join("");
   }
@@ -229,6 +250,27 @@ function paintStatus(status) {
 
   const stamp = el("stamp");
   if (stamp) stamp.textContent = "Updated just now";
+}
+
+// Poll the tunnel state file and flip the whole UI online<->offline. This is the
+// authoritative online/offline signal; it runs every 5s so "going dark" (or
+// coming back) shows on the phone within seconds.
+async function pollTunnelState() {
+  try {
+    const res = await api("/api/tunnel/state");
+    applyTunnelState(res && res.state);
+  } catch (e) {
+    if (e.unauthorized) { renderLogin("Please sign in again."); return; }
+    // transient network error: keep the last known state on screen
+  }
+}
+
+function applyTunnelState(state) {
+  const online = state !== "down";
+  if (online === tunnelOnline) return; // no change -> nothing to repaint
+  tunnelOnline = online;
+  // Re-render fully so the dark banner and every service tile pick up the flip.
+  renderDashboard(lastStatus);
 }
 
 async function onToggle(currentlyOnline, controlAvailable) {
@@ -250,6 +292,7 @@ async function onToggle(currentlyOnline, controlAvailable) {
 
   try {
     const status = await api("/api/toggle", { method: "POST", body: { online: !currentlyOnline } });
+    tunnelOnline = status.online; // reflect the confirmed new state immediately
     renderDashboard(status);
   } catch (e) {
     if (e.unauthorized) { renderLogin("Please sign in again."); return; }
@@ -264,8 +307,10 @@ async function onToggle(currentlyOnline, controlAvailable) {
 function start() {
   if (token) renderDashboard();
   else renderLogin();
-  // Periodic refresh while the app is open.
+  // Periodic refresh while the app is open: services/backup every 20s, and the
+  // tunnel online/offline state every 5s so "going dark" shows up promptly.
   setInterval(() => { if (token) refreshStatus(); }, 20000);
+  setInterval(() => { if (token) pollTunnelState(); }, 5000);
 }
 
 if ("serviceWorker" in navigator) {

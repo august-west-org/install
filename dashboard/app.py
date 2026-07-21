@@ -140,6 +140,17 @@ async def status(_: str = Depends(require_session)):
     return _status_payload(await services.service_status())
 
 
+@app.get("/api/tunnel/state")
+async def tunnel_state(_: str = Depends(require_session)):
+    """Lightweight poll target for the phone UI.
+
+    Reads /etc/augustwest/tunnel/state and reports {"state": "up"|"down"} so the
+    dashboard can reflect "going dark" within a few seconds without the heavier
+    per-service health sweep that /api/status runs.
+    """
+    return {"state": tunnel.read_state_file()}
+
+
 class ToggleBody(BaseModel):
     online: bool
 
