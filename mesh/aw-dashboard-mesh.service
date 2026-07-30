@@ -1,0 +1,20 @@
+[Unit]
+Description=Forward tailnet dashboard connections to the loopback dashboard
+Requires=aw-dashboard-mesh.socket
+After=aw-dashboard-mesh.socket
+# NOT tied to aw-cloudflared: this is the path that must work when the tunnel is
+# deliberately down.
+
+[Service]
+# The dashboard container binds 127.0.0.1:8889 only. This tiny stock-systemd
+# proxy accepts tailnet connections from the socket unit above and splices them
+# to that loopback port, so nothing in the container or its compose file has to
+# be exposed on a routable address.
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd --exit-idle-time=5min 127.0.0.1:8889
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+DynamicUser=true
+Restart=on-failure
+RestartSec=2

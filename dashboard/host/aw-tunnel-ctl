@@ -6,6 +6,11 @@
 # a one-word intent to $DESIRED; this script (driven by systemd path/timer
 # units) applies it and records the observed state in $STATE for the dashboard
 # to read back.
+#
+# SCOPE: this script starts and stops aw-cloudflared.service and NOTHING else.
+# The August West fallback mesh (tailscaled + aw-mesh-* units) is what makes the
+# dashboard reachable while the tunnel is down, so going dark must never touch it.
+# After every apply we assert that -- see check_fallback below.
 set -euo pipefail
 
 SERVICE=aw-cloudflared.service
@@ -13,7 +18,27 @@ SPOOL=/etc/augustwest/tunnel
 DESIRED="$SPOOL/desired"
 STATE="$SPOOL/state"
 
+# Guard rail: the one service this script may drive. A typo or a future edit that
+# points this at the mesh fails here instead of stranding the device.
+case "$SERVICE" in
+  aw-cloudflared.service) ;;
+  *) echo "aw-tunnel-ctl: refusing to control '$SERVICE' -- only aw-cloudflared.service" >&2; exit 3 ;;
+esac
+
 mkdir -p "$SPOOL"
+
+# The fallback path must be up regardless of the tunnel. Taking the home dark is
+# exactly when it matters, so verify it right after applying and repair it if
+# something (a crash, a bad update) left it down.
+check_fallback() {
+  [ -x /usr/local/bin/aw-mesh-ctl ] || return 0
+  if systemctl is-active --quiet tailscaled 2>/dev/null; then
+    logger -t aw-tunnel-ctl "tunnel applied; fallback mesh still up (tailscaled active)"
+  else
+    logger -t aw-tunnel-ctl "WARNING: fallback mesh was down after a tunnel change -- repairing"
+    /usr/local/bin/aw-mesh-ctl ensure >/dev/null 2>&1 || true
+  fi
+}
 
 write_state() {
   if systemctl is-active --quiet "$SERVICE"; then
@@ -33,6 +58,7 @@ case "${1:-}" in
       systemctl start "$SERVICE" || true
     fi
     write_state
+    check_fallback
     ;;
   refresh)
     write_state

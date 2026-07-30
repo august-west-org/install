@@ -6,7 +6,9 @@ dashboard-<customer_domain> route. It:
 
   * authenticates with the customer's onboarding master password (auth.py),
   * reports each service's health + last-backup age (services.py),
-  * and toggles the public tunnel on/off (tunnel.py) -- "going dark".
+  * toggles the public tunnel on/off (tunnel.py) -- "going dark",
+  * and reports the FALLBACK address (mesh.py) to reach this dashboard when the
+    tunnel is off, so "going dark" is never a one-way door.
 """
 import asyncio
 import logging
@@ -18,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import auth
+import mesh
 import services
 import tunnel
 
@@ -132,6 +135,10 @@ def _status_payload(svc: list[dict]) -> dict:
         "services": svc,
         "backup": services.last_backup(),
         "offline_message": OFFLINE_MESSAGE,
+        # The way back in while the tunnel is off. Sent with every status payload
+        # so the phone always has a current fallback address cached before the
+        # customer goes dark.
+        "mesh": mesh.status(),
     }
 
 
@@ -151,12 +158,35 @@ async def tunnel_state(_: str = Depends(require_session)):
     return {"state": tunnel.read_state_file()}
 
 
+@app.get("/api/mesh")
+async def mesh_public():
+    """Fallback address, available WITHOUT signing in (login screen + support).
+
+    Unauthenticated on purpose: the customer needs this address while the tunnel
+    is still up -- that is the only time they can read it off the login screen --
+    and support needs it to talk a customer back online. See mesh.public_status()
+    for what is (and is not) exposed.
+    """
+    return mesh.public_status()
+
+
 class ToggleBody(BaseModel):
     online: bool
 
 
 @app.post("/api/toggle")
 async def toggle(body: ToggleBody, _: str = Depends(require_session)):
+    # Record the way back in BEFORE severing the public path, so a support
+    # engineer reading the journal after a customer goes dark can see the address
+    # that still works. Note what this does NOT do: nothing here touches the
+    # mesh -- tunnel.set_online() only ever drives aw-cloudflared.service.
+    if not body.online:
+        m = mesh.status()
+        logger.info(
+            "going dark; fallback path %s (%s)",
+            "available at " + m["address"] if m.get("available") else "UNAVAILABLE",
+            m.get("reason") or m.get("backend"),
+        )
     try:
         tunnel.set_online(body.online)
     except Exception as e:  # noqa: BLE001 -- report, don't 500 opaquely

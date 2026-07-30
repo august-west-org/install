@@ -1,0 +1,17 @@
+[Unit]
+Description=August West dashboard, reachable over the fallback mesh (tailnet only)
+Documentation=file:/opt/augustwest/mesh/README.md
+
+[Socket]
+# ListenStream is NOT set here: aw-mesh-ctl writes a drop-in
+# (/etc/systemd/system/aw-dashboard-mesh.socket.d/10-tailnet-address.conf) that
+# binds this listener to THIS device's current tailnet address, e.g.
+#   ListenStream=100.64.0.7:8889
+# Binding the specific tailnet IP -- never 0.0.0.0 -- is what keeps the dashboard
+# off the public internet while making it reachable from the tailnet, matching
+# the 127.0.0.1-only rule the rest of the stack follows.
+FreeBind=true
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

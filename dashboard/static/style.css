@@ -110,6 +110,18 @@ p.sub { color: var(--muted); font-size: 15px; line-height: 1.6; margin: 0 0 18px
 }
 
 /* ---- service status rows ---- */
+/* Backup ("fallback mesh") address -- shown on the login screen and under the
+   toggle, because it is what the customer needs while their home is dark. */
+.mesh-box { margin-top: 16px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--navy-3); }
+.mesh-box.warn { border-color: rgba(224,135,111,0.5); background: rgba(224,135,111,0.08); }
+.mesh-title { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--steel-bright); }
+.mesh-addr {
+  margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+  background: rgba(0,0,0,0.28); color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 15px; word-break: break-all; user-select: all;
+}
+
 .section-title { font-weight: 600; font-size: 15px; margin: 0 0 12px; letter-spacing: 0.02em; }
 .svc-row {
   display: flex; align-items: center; justify-content: space-between;

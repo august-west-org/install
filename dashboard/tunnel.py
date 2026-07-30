@@ -5,6 +5,12 @@ The tunnel is the customer's "front door". Turning it OFF makes the home go
 dark: no request from the outside can reach any service. The services themselves
 keep running on loopback -- only the public path is severed.
 
+SCOPE -- aw-cloudflared.service AND NOTHING ELSE. In particular the toggle must
+never touch tailscaled / the August West fallback mesh (see mesh.py): that link
+is the only way to reach this dashboard once the tunnel is down, so taking it
+down with the tunnel would make "offline" a one-way door. SERVICE below is the
+single service this module is allowed to drive, and _assert_scope() enforces it.
+
 Two backends, auto-selected:
 
 * Direct  -- used when `systemctl` is available to this process (the app running
@@ -24,6 +30,21 @@ import shutil
 import subprocess
 
 SERVICE = "aw-cloudflared.service"
+
+# The toggle's blast radius, asserted rather than assumed: if a future change
+# widens SERVICE (say to stop tailscaled too, or a wildcard), every start/stop
+# call fails loudly here instead of silently stranding the device.
+ALLOWED_SERVICES = frozenset({SERVICE})
+
+
+def _assert_scope(name: str) -> None:
+    if name not in ALLOWED_SERVICES:
+        raise RuntimeError(
+            f"refusing to control {name!r}: the offline toggle may only drive "
+            f"{sorted(ALLOWED_SERVICES)} -- the fallback mesh must stay up"
+        )
+
+
 SPOOL_DIR = os.environ.get("AW_TUNNEL_SPOOL_DIR", "/etc/augustwest/tunnel")
 DESIRED_PATH = os.path.join(SPOOL_DIR, "desired")
 STATE_PATH = os.path.join(SPOOL_DIR, "state")
@@ -50,6 +71,7 @@ def _direct_state() -> str:
 
 
 def _direct_set(up: bool) -> None:
+    _assert_scope(SERVICE)
     subprocess.run(
         ["systemctl", "start" if up else "stop", SERVICE],
         capture_output=True, text=True, timeout=30, check=True,

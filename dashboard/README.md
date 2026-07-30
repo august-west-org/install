@@ -15,7 +15,15 @@ customer's device at `127.0.0.1:8889` (reached over the Cloudflare Tunnel).
   / Smart Home Online·Offline, plus "Last backup: X ago".
 - **Online/Offline toggle** — a big switch. OFF stops `aw-cloudflared` (the whole
   home goes dark); ON starts it. Going offline asks for confirmation and then
-  shows *"Your data is dark — no one can reach it."*
+  shows *"Your data is dark — no one can reach it."* It stops **only** the
+  Cloudflare tunnel — never the fallback mesh below.
+- **Backup connection** — the tailnet address of this dashboard
+  (`http://<tailnet-ip>:8889`), shown on the login screen, under the toggle, and
+  in the go-dark confirmation. It reaches the dashboard while the tunnel is off,
+  so the toggle is not a one-way door. Served by `/api/mesh` (no session needed —
+  the customer must be able to read it *before* going dark) from
+  `/etc/augustwest/mesh/state`, which the host publishes; see `mesh.py` and
+  `../mesh/README.md`. Support runbook: `SUPPORT-OFFLINE.md`.
 - **Quick links** to each service (derived from the dashboard's own hostname).
 - **Support** button → email to hello@augustwest.org.
 - **Auth** with the onboarding master password (never stored in plaintext — the
@@ -32,6 +40,12 @@ reads for status. Install those units once on the host:
 ```sh
 /opt/augustwest/dashboard/host/install.sh
 ```
+
+Scope is enforced on both sides: `tunnel.ALLOWED_SERVICES` in the app and a guard
+in `host/aw-tunnel-ctl` allow `aw-cloudflared.service` and nothing else, and
+`aw-tunnel-ctl` re-checks the fallback mesh after every apply. The mesh path
+(`../mesh/`) is read-only to this app — it can report the fallback but cannot
+take it down.
 
 ## Deploy (added to install.sh alongside the onboarding step)
 

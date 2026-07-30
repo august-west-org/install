@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically self-heal the August West fallback mesh and publish its state
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=aw-mesh-refresh.service
+
+[Install]
+WantedBy=timers.target

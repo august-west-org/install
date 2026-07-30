@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""aw-mesh-bridge -- local control-plane shim for the August West fallback mesh.
+
+WHY THIS EXISTS
+    headscale.augustwest.org is published through a Cloudflare Tunnel. The
+    Cloudflare edge forwards only `Upgrade: websocket`; it STRIPS the
+    `Upgrade: tailscale-control-protocol` header that a stock Tailscale client
+    uses to open its control session. Headscale then sees a request with no
+    Upgrade header and answers 500 "Internal error", so `tailscale up` can never
+    register. (Verified on this device: with the control-protocol upgrade the
+    origin receives `Connection: keep-alive` and no Upgrade header; with
+    `Upgrade: websocket` the coordinator returns 101 Switching Protocols.)
+
+    Tailscale's control server (which headscale embeds) also speaks the SAME
+    control protocol over a websocket -- that is the transport its wasm client
+    uses -- but the Linux client has no flag to choose it. This bridge supplies
+    the missing transport locally:
+
+        tailscaled --login-server http://127.0.0.1:8990
+              |  plaintext control-protocol upgrade, loopback only
+              v
+        aw-mesh-bridge
+              |  wss://headscale.augustwest.org/ts2021  (Upgrade: websocket)
+              v
+        Headscale (through its Cloudflare Tunnel)
+
+    Only the framing changes. The control session inside is the client's own
+    Noise (ts2021) session, end-to-end encrypted between tailscaled and
+    Headscale: this process cannot read or alter it, and it holds no keys.
+
+    This is a workaround for how the coordinator is published, not a permanent
+    design. When headscale.augustwest.org is served directly (DNS-only record,
+    TLS on the origin) instead of through a Cloudflare Tunnel, run
+    `aw-mesh-ctl reprobe`: it detects the working direct upgrade, points
+    tailscaled straight at the coordinator, and stops using this bridge.
+
+Dependencies: Python 3 standard library only -- nothing to install, nothing to
+build. The fallback path must not depend on a package index being reachable.
+"""
+from __future__ import annotations
+
+import base64
+import itertools
+import logging
+import os
+import secrets
+import socket
+import ssl
+import struct
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM = os.environ.get("AW_MESH_UPSTREAM", "https://headscale.augustwest.org")
+LISTEN_HOST = os.environ.get("AW_MESH_BRIDGE_HOST", "127.0.0.1")
+LISTEN_PORT = int(os.environ.get("AW_MESH_BRIDGE_PORT", "8990"))
+
+UPGRADE_TOKEN = "tailscale-control-protocol"   # controlhttp's upgrade + subprotocol
+HANDSHAKE_HEADER = "X-Tailscale-Handshake"     # noise init: header here, query param upstream
+CONTROL_PATH = "/ts2021"
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s aw-mesh-bridge %(message)s"
+)
+log = logging.getLogger("aw-mesh-bridge")
+
+_up = urllib.parse.urlsplit(UPSTREAM)
+UP_HOST = _up.hostname or "headscale.augustwest.org"
+UP_PORT = _up.port or (443 if _up.scheme == "https" else 80)
+UP_TLS = _up.scheme != "http"
+
+
+# ---------------------------------------------------------------------------
+# Minimal RFC 6455 client framing.
+#   Scope on purpose: the payload is an opaque byte stream (tailscale treats the
+#   websocket as a net.Conn carrying binary messages), so message boundaries are
+#   irrelevant and every data frame is forwarded as it arrives.
+# ---------------------------------------------------------------------------
+class WSError(Exception):
+    pass
+
+
+def _mask(payload: bytes, key: bytes) -> bytes:
+    return bytes(b ^ k for b, k in zip(payload, itertools.cycle(key)))
+
+
+def ws_send(sock: socket.socket, payload: bytes, opcode: int = 0x2) -> None:
+    """Send one masked frame (clients MUST mask; opcode 0x2 = binary)."""
+    header = bytearray([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        header.append(0x80 | n)
+    elif n < 65536:
+        header.append(0x80 | 126)
+        header += struct.pack("!H", n)
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack("!Q", n)
+    key = secrets.token_bytes(4)
+    header += key
+    sock.sendall(bytes(header) + _mask(payload, key))
+
+
+class WSConn:
+    """Websocket reader over a socket, holding any bytes left from the handshake."""
+
+    def __init__(self, sock: socket.socket, leftover: bytes = b"") -> None:
+        self.sock = sock
+        self.buf = bytearray(leftover)
+
+    def _need(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise WSError("upstream closed")
+            self.buf += chunk
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def read_frame(self) -> tuple[int, bytes]:
+        b0, b1 = self._need(2)
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        length = b1 & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._need(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._need(8))[0]
+        key = self._need(4) if masked else b""
+        payload = self._need(length) if length else b""
+        if masked:
+            payload = _mask(payload, key)
+        return opcode, payload
+
+
+def ws_connect(path_with_query: str) -> WSConn:
+    """Open a websocket to the coordinator, negotiating the control subprotocol."""
+    raw = socket.create_connection((UP_HOST, UP_PORT), timeout=20)
+    if UP_TLS:
+        raw = ssl.create_default_context().wrap_socket(raw, server_hostname=UP_HOST)
+
+    nonce = base64.b64encode(secrets.token_bytes(16)).decode()
+    req = (
+        f"GET {path_with_query} HTTP/1.1\r\n"
+        f"Host: {UP_HOST}\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: {nonce}\r\n"
+        f"Sec-WebSocket-Protocol: {UPGRADE_TOKEN}\r\n"
+        "User-Agent: aw-mesh-bridge\r\n"
+        "\r\n"
+    )
+    raw.sendall(req.encode())
+
+    buf = bytearray()
+    while b"\r\n\r\n" not in buf:
+        chunk = raw.recv(65536)
+        if not chunk:
+            raise WSError("coordinator closed the connection during the upgrade")
+        buf += chunk
+        if len(buf) > 65536:
+            raise WSError("oversized upgrade response")
+    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+    if " 101 " not in status:
+        raise WSError(f"coordinator refused the websocket upgrade: {status}")
+    # The control server only accepts the session when it echoes the subprotocol.
+    if f"sec-websocket-protocol: {UPGRADE_TOKEN}".encode() not in head.lower():
+        raise WSError("coordinator did not negotiate the control subprotocol")
+
+    raw.settimeout(None)
+    return WSConn(raw, rest)
+
+
+# ---------------------------------------------------------------------------
+# HTTP front end for the local tailscaled
+# ---------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "aw-mesh-bridge"
+
+    def log_message(self, fmt, *args):  # keep the journal readable
+        log.debug("%s - %s", self.address_string(), fmt % args)
+
+    # -- control session ---------------------------------------------------
+    def _splice_control(self) -> None:
+        handshake = self.headers.get(HANDSHAKE_HEADER)
+        if not handshake:
+            self.send_error(400, "missing Tailscale handshake header")
+            return
+
+        query = urllib.parse.urlencode({HANDSHAKE_HEADER: handshake})
+        try:
+            up = ws_connect(f"{CONTROL_PATH}?{query}")
+        except (WSError, OSError, ssl.SSLError) as e:
+            log.warning("control upgrade to %s failed: %s", UPSTREAM, e)
+            self.send_error(502, "coordinator unreachable")
+            return
+
+        # Tell tailscaled the upgrade succeeded, then stop being an HTTP server
+        # on this connection: from here it is an opaque byte stream both ways.
+        self.close_connection = True
+        down = self.connection
+        self.wfile.write(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Connection: upgrade\r\n"
+            b"Upgrade: " + UPGRADE_TOKEN.encode() + b"\r\n\r\n"
+        )
+        self.wfile.flush()
+        log.info("control session established via websocket to %s", UP_HOST)
+
+        stop = threading.Event()
+
+        def down_to_up() -> None:
+            try:
+                while not stop.is_set():
+                    data = self.rfile.read1(65536)
+                    if not data:
+                        break
+                    ws_send(up.sock, data)
+            except (OSError, ValueError):
+                pass
+            finally:
+                stop.set()
+                try:
+                    up.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=down_to_up, daemon=True)
+        t.start()
+        try:
+            while not stop.is_set():
+                opcode, payload = up.read_frame()
+                if opcode in (0x0, 0x1, 0x2):        # continuation / text / binary
+                    if payload:
+                        down.sendall(payload)
+                elif opcode == 0x9:                  # ping -> pong
+                    ws_send(up.sock, payload, opcode=0xA)
+                elif opcode == 0x8:                  # close
+                    break
+        except (WSError, OSError):
+            pass
+        finally:
+            stop.set()
+            for s in (up.sock, down):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            log.info("control session closed")
+
+    # -- everything else: plain reverse proxy to the coordinator ------------
+    def _proxy(self, body: bytes | None) -> None:
+        url = urllib.parse.urljoin(UPSTREAM, self.path)
+        req = urllib.request.Request(url, data=body, method=self.command)
+        for h in ("Content-Type", "Accept", "User-Agent"):
+            if self.headers.get(h):
+                req.add_header(h, self.headers[h])
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                payload, status = r.read(), r.status
+                ctype = r.headers.get("Content-Type", "application/octet-stream")
+        except urllib.error.HTTPError as e:
+            payload, status = e.read(), e.code
+            ctype = e.headers.get("Content-Type", "text/plain")
+        except (urllib.error.URLError, OSError, ssl.SSLError) as e:
+            log.warning("proxy %s %s failed: %s", self.command, self.path, e)
+            self.send_error(502, "coordinator unreachable")
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        if self.path.split("?")[0] == CONTROL_PATH and \
+                UPGRADE_TOKEN in self.headers.get("Upgrade", "").lower():
+            self._splice_control()
+        else:
+            self._proxy(None)
+
+    def do_POST(self) -> None:
+        if self.path.split("?")[0] == CONTROL_PATH:
+            self._splice_control()
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        self._proxy(self.rfile.read(length) if length else b"")
+
+
+def main() -> int:
+    srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    srv.daemon_threads = True
+    log.info(
+        "listening on http://%s:%d -> %s (websocket control transport)",
+        LISTEN_HOST, LISTEN_PORT, UPSTREAM,
+    )
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

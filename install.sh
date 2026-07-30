@@ -11,8 +11,11 @@
 #
 # NETWORK MODEL
 #   External HTTPS is provided by a Cloudflare Tunnel (cloudflared), configured
-#   MANUALLY after this script runs. Tailscale/Headscale provides LAN-style
-#   access. Therefore every service port is published on 127.0.0.1 ONLY.
+#   MANUALLY after this script runs. Tailscale/Headscale (Step 6d) provides
+#   LAN-style access and is the PERMANENT fallback path: it is installed
+#   automatically, runs as its own always-on service, and the dashboard's offline
+#   toggle never touches it -- so taking the home dark is not a one-way door.
+#   Therefore every service port is published on 127.0.0.1 ONLY.
 #   Rationale: Docker's port publishing writes iptables rules that BYPASS UFW,
 #   so binding to 0.0.0.0 would expose services to the public internet even with
 #   `ufw default deny incoming`. Binding to 127.0.0.1 is safe-by-default and is
@@ -26,7 +29,10 @@
 #
 # Generated secrets are written to /root/augustwest-credentials.txt (chmod 600).
 #
-# This script is idempotent-ish but intended for a fresh host. Read before rerun.
+# This script is safe to re-run. Re-runs REUSE existing secrets, SKIP services
+# that are already running and healthy, and repair a Postgres cluster whose
+# on-disk password drifted from the generated one (see Step 3) rather than
+# crash-looping or destroying data.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -60,10 +66,13 @@ run_quiet() {
   fi
 }
 
-# Reinstall/idempotency helper: is a service already answering its health check?
-# Used to skip re-provisioning a service that is already up and healthy, so this
-# script can be re-run on the same host cleanly (see Steps 3-6).
-service_up() { curl -fsS -o /dev/null --max-time 5 "$1" 2>/dev/null; }
+# Reinstall guard: true iff a container is running AND its health URL answers.
+# Used to skip re-deploying a service that is already up and healthy.
+#   $1 = container name   $2 = health-check URL
+service_healthy() {
+  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ] \
+    && curl -fsS -o /dev/null --max-time 5 "$2" 2>/dev/null
+}
 
 echo
 echo "  Welcome to August West — setting up your private home cloud."
@@ -100,8 +109,9 @@ if ! swapon --show | grep -q /swapfile; then
   run_quiet swapon /swapfile
   grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
   run_quiet sysctl -w vm.swappiness=10
-  # /etc/sysctl.conf is absent on minimal Ubuntu images — create it before we
-  # grep/append so the read doesn't error and the setting still persists.
+  # Persist swappiness. /etc/sysctl.conf does not exist on some minimal images;
+  # grep-ing a missing file errors under `set -e`, and appending would target a
+  # non-existent path — so create it first if needed, then check-and-append.
   [ -f /etc/sysctl.conf ] || touch /etc/sysctl.conf
   grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
 fi
@@ -198,85 +208,66 @@ ok "Security keys generated."
 # Step 3 — Immich (photos) -> 127.0.0.1:2283
 # ---------------------------------------------------------------------------
 say "Setting up your Photo Vault... (this can take a couple of minutes)"
-if service_up http://127.0.0.1:2283/api/server/ping; then
-  # Reinstall safety: already up and answering -> leave it (and its data) alone.
-  note "Photo Vault already running and healthy — skipping."
+if service_healthy immich_server http://127.0.0.1:2283/api/server/ping; then
+  ok "Photo Vault already running"
 else
   cd /opt/augustwest/immich
-
-  # --- Reinstall safety for the Postgres bind-mount (./postgres) -------------
-  # Postgres bakes its superuser password in at FIRST init only and thereafter
-  # IGNORES DB_PASSWORD; a leftover ./postgres cluster from a previous run whose
-  # password no longer matches .env would otherwise leave immich_server crash-
-  # looping on "password authentication failed for user postgres". Resolve it
-  # automatically so a second run on the same host always converges cleanly:
-  #   - partial / uninitialized dir  -> remove it now, reinit fresh below
-  #   - initialized, NO real data    -> remove it, reinit cleanly (after start)
-  #   - initialized WITH real data   -> keep the photos, align password to .env
-  PG_DIR=/opt/augustwest/immich/postgres
-  PG_PREEXISTING=false
-  if [ -e "$PG_DIR" ]; then
-    if [ -f "$PG_DIR/PG_VERSION" ]; then
-      PG_PREEXISTING=true            # a real, initialized cluster — inspect after start
-    else
-      note "Clearing an incomplete photo database from a previous attempt..."
-      rm -rf "$PG_DIR"               # partial/empty dir: nothing worth preserving
-    fi
-  fi
-
   run_quiet curl -fsSL -o docker-compose.yml https://github.com/immich-app/immich/releases/latest/download/docker-compose.yml
   run_quiet curl -fsSL -o .env         https://github.com/immich-app/immich/releases/latest/download/example.env
   sed -i "s|- '2283:2283'|- '127.0.0.1:2283:2283'|" docker-compose.yml   # loopback only
   sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${IMMICH_DB_PASSWORD}|" .env
   grep -q '^TZ=' .env && sed -i "s|^TZ=.*|TZ=$(cat /etc/timezone 2>/dev/null||echo Etc/UTC)|" .env
-  run_quiet docker compose pull -q
-  run_quiet docker compose up -d
 
-  # If we brought a pre-existing cluster back up, reconcile its password with
-  # .env. The Postgres container itself starts fine regardless of the mismatch
-  # (it uses whatever is baked on disk), so it is available to inspect/repair.
-  if [ "$PG_PREEXISTING" = true ]; then
+  # -------------------------------------------------------------------------
+  # Reinstall safety for the Postgres cluster.
+  #   Postgres bakes its superuser password in at first init ONLY (on an empty
+  #   data dir); afterwards the DB_PASSWORD env var is ignored. A leftover
+  #   ./postgres from a previous install therefore keeps its OLD password, so
+  #   the freshly-sourced DB_PASSWORD in .env may not match and Immich would
+  #   crash-loop on "password authentication failed for user postgres".
+  #
+  #   Handle it automatically instead of failing:
+  #     - No real photo data on disk  -> remove ./postgres and let it re-init
+  #       cleanly with the current password.
+  #     - Real data present           -> preserve it and re-align the on-disk
+  #       password to .env via ALTER USER (local socket = trust/peer auth, so
+  #       this works even though the TCP password no longer matches).
+  # -------------------------------------------------------------------------
+  PG_DIR=/opt/augustwest/immich/postgres
+  if [ -f "$PG_DIR/PG_VERSION" ]; then
+    note "Found an existing Photo Vault database — checking it..."
+    # Bring up just the database container so we can inspect it. (Its own baked
+    # password is unaffected by any .env drift, so it starts fine regardless.)
+    run_quiet docker compose up -d database || run_quiet docker compose up -d
     for _ in $(seq 1 30); do docker exec immich_postgres pg_isready -q 2>/dev/null && break; sleep 2; done
-
-    if docker exec -e PGPASSWORD="${IMMICH_DB_PASSWORD}" immich_postgres \
-         psql -h 127.0.0.1 -U postgres -d immich -tAc 'select 1' >/dev/null 2>&1; then
-      : # configured password already works — cluster is consistent with .env
+    # Count real user tables (anything outside the built-in system schemas).
+    # Local socket connections authenticate via trust/peer, so no password is
+    # needed here regardless of the cluster's current password.
+    TABLES=$(docker exec immich_postgres psql -U postgres -d immich -tAc \
+      "select count(*) from information_schema.tables where table_schema not in ('pg_catalog','information_schema');" \
+      2>/dev/null | tr -d '[:space:]' || true)
+    if [ -n "$TABLES" ] && [ "$TABLES" -gt 0 ] 2>/dev/null; then
+      ok "Found existing Photo Vault data - preserving your photos"
+      # Re-align the on-disk password to the one Immich will connect with.
+      if docker exec immich_postgres psql -U postgres \
+           -c "ALTER USER postgres PASSWORD '${IMMICH_DB_PASSWORD}';" >/dev/null 2>&1; then
+        ok "Photo database password re-aligned."
+      else
+        note "Could not re-align the database password automatically (see $LOG)."
+      fi
     else
-      # Password mismatch. Decide by whether the cluster holds real photo data.
-      # Local unix-socket superuser access uses trust auth, so we can inspect and
-      # repair WITHOUT knowing the old password.
-      has_data=false
-      assets=$(docker exec immich_postgres psql -U postgres -d immich -tAc \
-                 "SELECT count(*) FROM assets" 2>/dev/null | tr -dc '0-9')
-      if [ -n "$assets" ]; then
-        [ "$assets" -gt 0 ] && has_data=true
-      else
-        # assets table absent (schema differs / never fully initialized): fall
-        # back to whether the immich DB has ANY user tables. If it does, preserve
-        # to be safe; a completely empty DB is safe to discard.
-        ntables=$(docker exec immich_postgres psql -U postgres -d immich -tAc \
-          "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null | tr -dc '0-9')
-        [ -n "$ntables" ] && [ "$ntables" -gt 0 ] && has_data=true
-      fi
-
-      if [ "$has_data" = true ]; then
-        note "Existing photo library detected — keeping your photos and re-aligning"
-        note "the database password automatically (no data will be lost)."
-        docker exec -i immich_postgres psql -U postgres \
-          -c "ALTER USER postgres PASSWORD '${IMMICH_DB_PASSWORD}';" >> "$LOG" 2>&1
-        run_quiet docker compose restart
-      else
-        note "Found an old, empty photo database — clearing it for a clean setup."
-        run_quiet docker compose down
-        rm -rf "$PG_DIR"
-        run_quiet docker compose up -d
-      fi
+      note "No photos stored yet — resetting the database for a clean install."
+      run_quiet docker compose down || true
+      rm -rf "$PG_DIR"
     fi
   fi
+
+  run_quiet docker compose pull -q
+  run_quiet docker compose up -d
   # health: curl http://127.0.0.1:2283/api/server/ping  -> {"res":"pong"}
+  ok "Photo Vault ready."
   cd /root
 fi
-ok "Photo Vault ready."
 
 # ---------------------------------------------------------------------------
 # Step 4 — Vaultwarden (passwords) -> 127.0.0.1:8443
@@ -284,10 +275,10 @@ ok "Photo Vault ready."
 #   tunnel URL once known. SIGNUPS_ALLOWED=true for onboarding -> flip to false.
 # ---------------------------------------------------------------------------
 say "Setting up your Password Manager..."
-if service_up http://127.0.0.1:8443/alive; then
-  note "Password Manager already running and healthy — skipping."
+if service_healthy vaultwarden http://127.0.0.1:8443/alive; then
+  ok "Password Manager already running"
 else
-cat > /opt/augustwest/vaultwarden/docker-compose.yml <<EOF
+  cat > /opt/augustwest/vaultwarden/docker-compose.yml <<EOF
 services:
   vaultwarden:
     image: vaultwarden/server:latest
@@ -302,26 +293,23 @@ services:
     ports:
       - "127.0.0.1:8443:80"
 EOF
-cd /opt/augustwest/vaultwarden && run_quiet docker compose pull -q && run_quiet docker compose up -d
-cd /root
+  cd /opt/augustwest/vaultwarden && run_quiet docker compose pull -q && run_quiet docker compose up -d
+  # health: curl http://127.0.0.1:8443/alive  -> ISO timestamp
+  ok "Password Manager ready."
+  cd /root
 fi
-# health: curl http://127.0.0.1:8443/alive  -> ISO timestamp
-ok "Password Manager ready."
 
 # ---------------------------------------------------------------------------
 # Step 5 — Nextcloud (files) -> 127.0.0.1:8080   [Nextcloud + MariaDB + Redis]
 # ---------------------------------------------------------------------------
 say "Setting up your File Cloud..."
-# Reinstall safety: skip if Nextcloud is already installed and healthy. status.php
-# reports {"installed":true,...} only once first-run setup has completed, so this
-# guard is true only for a genuinely ready instance (not one mid-initialization).
-if curl -fsS --max-time 5 http://127.0.0.1:8080/status.php 2>/dev/null | grep -q '"installed":true'; then
-  note "File Cloud already running and healthy — skipping."
+if service_healthy nextcloud_app http://127.0.0.1:8080/status.php; then
+  ok "File Cloud already running"
 else
-# `|| true`: don't let a missing default route (pipefail) abort the install; an
-# empty HOST_IP just drops out of the trusted-domains list below.
-HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)
-cat > /opt/augustwest/nextcloud/docker-compose.yml <<EOF
+  # `|| true`: don't let a missing default route (pipefail) abort the install; an
+  # empty HOST_IP just drops out of the trusted-domains list below.
+  HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)
+  cat > /opt/augustwest/nextcloud/docker-compose.yml <<EOF
 services:
   db:
     image: mariadb:11
@@ -356,25 +344,25 @@ services:
       # behind cloudflared later: also set OVERWRITEPROTOCOL=https + TRUSTED_PROXIES
     volumes: [ "./html:/var/www/html" ]
 EOF
-cd /opt/augustwest/nextcloud && run_quiet docker compose pull -q && run_quiet docker compose up -d
-# health: curl http://127.0.0.1:8080/status.php  -> {"installed":true,...}
-note "Waiting for your File Cloud to finish its first-time setup..."
+  cd /opt/augustwest/nextcloud && run_quiet docker compose pull -q && run_quiet docker compose up -d
+  # health: curl http://127.0.0.1:8080/status.php  -> {"installed":true,...}
+  note "Waiting for your File Cloud to finish its first-time setup..."
 
-# Trust the customer's public (Cloudflare Tunnel) hostname. Without this,
-# Nextcloud rejects requests whose Host is files-<customer>.augustwest.org with
-# "Trusted domain error" (HTTP 400) and the files monitor stays DOWN. occ only
-# works once first-run install has finished, so wait for status.php to report
-# installed:true before setting it (index 2 -> the public host).
-: "${CUSTOMER:?set CUSTOMER (August West customer slug)}"
-for _ in $(seq 1 60); do
-  curl -fsS http://127.0.0.1:8080/status.php 2>/dev/null | grep -q '"installed":true' && break
-  sleep 5
-done
-run_quiet docker exec -u www-data nextcloud_app php occ config:system:set \
-  trusted_domains 2 --value="files-${CUSTOMER}.augustwest.org"
-cd /root
+  # Trust the customer's public (Cloudflare Tunnel) hostname. Without this,
+  # Nextcloud rejects requests whose Host is files-<customer>.augustwest.org with
+  # "Trusted domain error" (HTTP 400) and the files monitor stays DOWN. occ only
+  # works once first-run install has finished, so wait for status.php to report
+  # installed:true before setting it (index 2 -> the public host).
+  : "${CUSTOMER:?set CUSTOMER (August West customer slug)}"
+  for _ in $(seq 1 60); do
+    curl -fsS http://127.0.0.1:8080/status.php 2>/dev/null | grep -q '"installed":true' && break
+    sleep 5
+  done
+  run_quiet docker exec -u www-data nextcloud_app php occ config:system:set \
+    trusted_domains 2 --value="files-${CUSTOMER}.augustwest.org"
+  ok "File Cloud ready."
+  cd /root
 fi
-ok "File Cloud ready."
 
 # ---------------------------------------------------------------------------
 # Step 6 — Home Assistant (smart home) -> 127.0.0.1:8123
@@ -382,10 +370,10 @@ ok "File Cloud ready."
 #   auto-discovery switch to network_mode: host later.
 # ---------------------------------------------------------------------------
 say "Setting up your Smart Home hub..."
-if service_up http://127.0.0.1:8123/manifest.json; then
-  note "Smart Home hub already running and healthy — skipping."
+if service_healthy homeassistant http://127.0.0.1:8123/manifest.json; then
+  ok "Smart Home hub already running"
 else
-cat > /opt/augustwest/homeassistant/docker-compose.yml <<EOF
+  cat > /opt/augustwest/homeassistant/docker-compose.yml <<EOF
 services:
   homeassistant:
     image: ghcr.io/home-assistant/home-assistant:stable
@@ -398,22 +386,22 @@ services:
       - /run/dbus:/run/dbus:ro
     ports: [ "127.0.0.1:8123:8123" ]
 EOF
-# Home Assistant reads /config/configuration.yaml — that is the bind-mounted
-# ./config dir above, i.e. host path /opt/augustwest/homeassistant/config/
-# (NOT /opt/augustwest/homeassistant/configuration.yaml). Write it BEFORE the
-# first start so HA trusts the cloudflared reverse proxy from the outset;
-# otherwise HA answers forwarded requests with "400: Bad Request" (surfacing as
-# HTTP 502 at the tunnel) and the smarthome monitor stays DOWN. default_config:
-# preserves the normal HA setup (UI, onboarding, integrations).
-#
-# trusted_proxies must include whatever bridge gateway cloudflared connects
-# from. Docker assigns bridge-network gateways non-deterministically (172.17/
-# 172.18/172.21/... depending on network creation order), so pinning ONE IP is
-# fragile -- a differently-numbered gateway leaves HA rejecting every forwarded
-# request. Trust the whole Docker private bridge range (172.16.0.0/12) instead,
-# which covers every gateway Docker can hand out.
-mkdir -p /opt/augustwest/homeassistant/config
-cat > /opt/augustwest/homeassistant/config/configuration.yaml <<'EOF'
+  # Home Assistant reads /config/configuration.yaml — that is the bind-mounted
+  # ./config dir above, i.e. host path /opt/augustwest/homeassistant/config/
+  # (NOT /opt/augustwest/homeassistant/configuration.yaml). Write it BEFORE the
+  # first start so HA trusts the cloudflared reverse proxy from the outset;
+  # otherwise HA answers forwarded requests with "400: Bad Request" (surfacing as
+  # HTTP 502 at the tunnel) and the smarthome monitor stays DOWN. default_config:
+  # preserves the normal HA setup (UI, onboarding, integrations).
+  #
+  # trusted_proxies must include whatever bridge gateway cloudflared connects
+  # from. Docker assigns bridge-network gateways non-deterministically (172.17/
+  # 172.18/172.21/... depending on network creation order), so pinning ONE IP is
+  # fragile -- a differently-numbered gateway leaves HA rejecting every forwarded
+  # request. Trust the whole Docker private bridge range (172.16.0.0/12) instead,
+  # which covers every gateway Docker can hand out.
+  mkdir -p /opt/augustwest/homeassistant/config
+  cat > /opt/augustwest/homeassistant/config/configuration.yaml <<'EOF'
 default_config:
 
 http:
@@ -423,22 +411,86 @@ http:
     - ::1
     - 172.16.0.0/12
 EOF
-cd /opt/augustwest/homeassistant && run_quiet docker compose pull -q && run_quiet docker compose up -d
-cd /root
+  cd /opt/augustwest/homeassistant && run_quiet docker compose pull -q && run_quiet docker compose up -d
+  # health: curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8123/  -> 302
+  ok "Smart Home hub ready."
+  cd /root
 fi
-# health: curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8123/  -> 302
-ok "Smart Home hub ready."
+
+ONBOARD_DIR=/opt/augustwest/onboarding
+
+# ---------------------------------------------------------------------------
+# Step 6-pre — fetch the onboarding wizard source from GitHub
+#   The wizard (Step 6a) deploys from /opt/augustwest/onboarding, but that source
+#   is NOT bundled with this script — pull it from the PUBLIC august-west-org/
+#   install repo (its onboarding/ subdirectory) now, so a plain `curl | bash` of
+#   this script is self-contained. The repo is public, so NO auth/token is needed
+#   (customers never hold operator credentials), and we avoid a hard git
+#   dependency by downloading the branch tarball and unpacking ONLY the
+#   onboarding/ subdir with curl + tar. If that path fails and git is present, we
+#   fall back to a sparse checkout of just that subdir. Fetch attempts are logged
+#   quietly (not via run_quiet) so a recoverable miss doesn't alarm the customer;
+#   we surface our own message instead. Already-present source (a re-run, or an
+#   operator who pre-seeded the dir) is left untouched.
+# ---------------------------------------------------------------------------
+ONBOARD_REPO=august-west-org/install
+ONBOARD_BRANCH=main
+if [ -f "$ONBOARD_DIR/docker-compose.yml" ]; then
+  note "Setup assistant source already present — keeping it."
+else
+  say "Downloading your setup assistant..."
+  fetched=false
+
+  # Primary: branch tarball -> extract only the onboarding/ subdir (curl + tar,
+  # no git, no auth). find locates onboarding/ under the tarball's top dir
+  # (github names it <repo>-<branch>/), guarding against branch-name changes.
+  tmp_tar="$(mktemp)"; tmp_ex="$(mktemp -d)"
+  if curl -fsSL -o "$tmp_tar" \
+       "https://codeload.github.com/${ONBOARD_REPO}/tar.gz/refs/heads/${ONBOARD_BRANCH}" >>"$LOG" 2>&1 \
+     && tar -xzf "$tmp_tar" -C "$tmp_ex" >>"$LOG" 2>&1; then
+    src_dir="$(find "$tmp_ex" -maxdepth 2 -type d -name onboarding | head -n1)"
+    if [ -n "$src_dir" ] && [ -f "$src_dir/docker-compose.yml" ]; then
+      mkdir -p "$ONBOARD_DIR"
+      cp -a "$src_dir"/. "$ONBOARD_DIR"/   # -a preserves dotfiles (.dockerignore)
+      fetched=true
+    fi
+  fi
+  rm -rf "$tmp_tar" "$tmp_ex"
+
+  # Fallback: sparse git checkout of just the onboarding/ subdir.
+  if [ "$fetched" != true ] && command -v git >/dev/null 2>&1; then
+    note "Retrying the download via git..."
+    tmp_git="$(mktemp -d)"
+    if git clone --depth 1 --filter=blob:none --sparse \
+         "https://github.com/${ONBOARD_REPO}.git" "$tmp_git" >>"$LOG" 2>&1 \
+       && ( cd "$tmp_git" && git sparse-checkout set onboarding >>"$LOG" 2>&1 ) \
+       && [ -f "$tmp_git/onboarding/docker-compose.yml" ]; then
+      mkdir -p "$ONBOARD_DIR"
+      cp -a "$tmp_git/onboarding/." "$ONBOARD_DIR"/
+      fetched=true
+    fi
+    rm -rf "$tmp_git"
+  fi
+
+  if [ "$fetched" = true ]; then
+    ok "Setup assistant downloaded."
+  else
+    echo "WARNING: could not download the onboarding wizard from ${ONBOARD_REPO}" >&2
+    echo "         (onboarding/ subdir) — the wizard step below will be skipped." >&2
+    echo "         The rest of the stack still works; re-run once GitHub is" >&2
+    echo "         reachable, or pre-seed $ONBOARD_DIR manually." >&2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Step 6a — onboarding wizard (August West setup UI) -> 127.0.0.1:8888
-#   Runs as a container built from /opt/augustwest/onboarding (shipped alongside
-#   this script). The wizard's first screen is a health gate and its account
+#   Runs as a container built from /opt/augustwest/onboarding (downloaded in
+#   Step 6-pre). The wizard's first screen is a health gate and its account
 #   step calls each service's API, so wait until all four answer their health
 #   checks before starting it. Loopback-only, like every other service; the
 #   Cloudflare Tunnel's setup-<customer_domain> route (added in Step 6b) is what
 #   exposes it. restart: unless-stopped keeps it up across reboots.
 # ---------------------------------------------------------------------------
-ONBOARD_DIR=/opt/augustwest/onboarding
 if [ -f "$ONBOARD_DIR/docker-compose.yml" ]; then
   say "Getting your setup assistant ready..."
   note "Making sure all four apps are responding..."
@@ -460,6 +512,167 @@ if [ -f "$ONBOARD_DIR/docker-compose.yml" ]; then
 else
   echo "WARNING: $ONBOARD_DIR/docker-compose.yml not found — onboarding wizard NOT deployed." >&2
   echo "         Ship the onboarding/ directory alongside this script to enable it." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6c — August West dashboard (customer PWA) -> 127.0.0.1:8889
+#   The installable phone dashboard: plain-English service status + a big
+#   "go dark" toggle. Source is NOT bundled with this script — pull it from the
+#   PUBLIC august-west-org/install repo (its dashboard/ subdirectory), exactly
+#   like the onboarding wizard above (tarball first, git sparse-checkout
+#   fallback; already-present source left untouched). Then install the host-side
+#   tunnel-control systemd units (so the loopback container can start/stop
+#   aw-cloudflared WITHOUT holding host root/systemd) and bring the container up.
+# ---------------------------------------------------------------------------
+DASH_DIR=/opt/augustwest/dashboard
+if [ -f "$DASH_DIR/docker-compose.yml" ]; then
+  note "Dashboard source already present — keeping it."
+else
+  say "Downloading your home dashboard..."
+  fetched=false
+
+  # Primary: branch tarball -> extract only the dashboard/ subdir (curl + tar).
+  tmp_tar="$(mktemp)"; tmp_ex="$(mktemp -d)"
+  if curl -fsSL -o "$tmp_tar" \
+       "https://codeload.github.com/${ONBOARD_REPO}/tar.gz/refs/heads/${ONBOARD_BRANCH}" >>"$LOG" 2>&1 \
+     && tar -xzf "$tmp_tar" -C "$tmp_ex" >>"$LOG" 2>&1; then
+    src_dir="$(find "$tmp_ex" -maxdepth 2 -type d -name dashboard | head -n1)"
+    if [ -n "$src_dir" ] && [ -f "$src_dir/docker-compose.yml" ]; then
+      mkdir -p "$DASH_DIR"
+      cp -a "$src_dir"/. "$DASH_DIR"/   # -a preserves dotfiles + host/ + icons
+      fetched=true
+    fi
+  fi
+  rm -rf "$tmp_tar" "$tmp_ex"
+
+  # Fallback: sparse git checkout of just the dashboard/ subdir.
+  if [ "$fetched" != true ] && command -v git >/dev/null 2>&1; then
+    note "Retrying the download via git..."
+    tmp_git="$(mktemp -d)"
+    if git clone --depth 1 --filter=blob:none --sparse \
+         "https://github.com/${ONBOARD_REPO}.git" "$tmp_git" >>"$LOG" 2>&1 \
+       && ( cd "$tmp_git" && git sparse-checkout set dashboard >>"$LOG" 2>&1 ) \
+       && [ -f "$tmp_git/dashboard/docker-compose.yml" ]; then
+      mkdir -p "$DASH_DIR"
+      cp -a "$tmp_git/dashboard/." "$DASH_DIR"/
+      fetched=true
+    fi
+    rm -rf "$tmp_git"
+  fi
+
+  if [ "$fetched" = true ]; then
+    ok "Dashboard downloaded."
+  else
+    echo "WARNING: could not download the dashboard from ${ONBOARD_REPO}" >&2
+    echo "         (dashboard/ subdir) — the dashboard will be skipped. The rest of" >&2
+    echo "         the stack still works; re-run once GitHub is reachable." >&2
+  fi
+fi
+
+if [ -f "$DASH_DIR/docker-compose.yml" ]; then
+  say "Setting up your home dashboard..."
+  # Host-side tunnel-control units: let the loopback dashboard container toggle
+  # aw-cloudflared on/off via a shared-file spool, without host root/systemd in
+  # the container. Idempotent (installs + enables the path/timer units).
+  if [ -f "$DASH_DIR/host/install.sh" ]; then
+    run_quiet bash "$DASH_DIR/host/install.sh"
+  fi
+  ( cd "$DASH_DIR" && run_quiet docker compose up -d --build )
+  ok "Home dashboard ready."
+else
+  echo "WARNING: $DASH_DIR/docker-compose.yml not found — dashboard NOT deployed." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6d — private fallback network (Tailscale -> August West Headscale)
+#   The dashboard's offline toggle stops aw-cloudflared, and that tunnel is also
+#   the phone's only route TO the dashboard: without a second path, "offline" is
+#   a one-way door nobody can reopen remotely. So before the public tunnel is set
+#   up we install the permanent fallback — a Tailscale client joined to
+#   headscale.augustwest.org, running as its own always-on service that the
+#   toggle never touches — and publish the dashboard on the device's tailnet
+#   address (loopback-only container untouched; nothing new goes public).
+#
+#   Source is NOT bundled with this script: pull mesh/ from the PUBLIC
+#   august-west-org/install repo exactly like onboarding/ and dashboard/ above.
+#
+#   HEADSCALE_AUTHKEY (a Headscale pre-auth key) is an August West OPERATOR
+#   credential read ONLY from the environment, like CF_API_TOKEN and
+#   PROVISION_TOKEN. Without it the client is still installed and started and
+#   prints a registration URL for support to approve; the 60s self-heal timer
+#   completes the join the moment it is approved. Never fatal to the install.
+# ---------------------------------------------------------------------------
+MESH_DIR=/opt/augustwest/mesh
+if [ -f "$MESH_DIR/aw-mesh-setup.sh" ]; then
+  note "Private connection source already present — keeping it."
+else
+  say "Downloading your private connection..."
+  fetched=false
+
+  # Primary: branch tarball -> extract only the mesh/ subdir (curl + tar).
+  tmp_tar="$(mktemp)"; tmp_ex="$(mktemp -d)"
+  if curl -fsSL -o "$tmp_tar" \
+       "https://codeload.github.com/${ONBOARD_REPO}/tar.gz/refs/heads/${ONBOARD_BRANCH}" >>"$LOG" 2>&1 \
+     && tar -xzf "$tmp_tar" -C "$tmp_ex" >>"$LOG" 2>&1; then
+    src_dir="$(find "$tmp_ex" -maxdepth 2 -type d -name mesh | head -n1)"
+    if [ -n "$src_dir" ] && [ -f "$src_dir/aw-mesh-setup.sh" ]; then
+      mkdir -p "$MESH_DIR"
+      cp -a "$src_dir"/. "$MESH_DIR"/
+      fetched=true
+    fi
+  fi
+  rm -rf "$tmp_tar" "$tmp_ex"
+
+  # Fallback: sparse git checkout of just the mesh/ subdir.
+  if [ "$fetched" != true ] && command -v git >/dev/null 2>&1; then
+    note "Retrying the download via git..."
+    tmp_git="$(mktemp -d)"
+    if git clone --depth 1 --filter=blob:none --sparse \
+         "https://github.com/${ONBOARD_REPO}.git" "$tmp_git" >>"$LOG" 2>&1 \
+       && ( cd "$tmp_git" && git sparse-checkout set mesh >>"$LOG" 2>&1 ) \
+       && [ -f "$tmp_git/mesh/aw-mesh-setup.sh" ]; then
+      mkdir -p "$MESH_DIR"
+      cp -a "$tmp_git/mesh/." "$MESH_DIR"/
+      fetched=true
+    fi
+    rm -rf "$tmp_git"
+  fi
+
+  if [ "$fetched" = true ]; then
+    ok "Private connection downloaded."
+  else
+    echo "WARNING: could not download mesh/ from ${ONBOARD_REPO} — the private" >&2
+    echo "         fallback connection was NOT installed. The stack still works," >&2
+    echo "         but taking the home offline from the dashboard would leave no" >&2
+    echo "         remote way to turn it back on. Re-run once GitHub is reachable." >&2
+  fi
+fi
+
+: "${HEADSCALE_URL:=https://headscale.augustwest.org}"
+: "${HEADSCALE_AUTHKEY:=}"
+
+if [ -f "$MESH_DIR/aw-mesh-setup.sh" ]; then
+  say "Setting up your private connection..."
+  if [ -z "$HEADSCALE_AUTHKEY" ]; then
+    # Operator-facing detail (missing HEADSCALE_AUTHKEY env var): the device will
+    # sit unregistered until support approves it on the coordinator.
+    echo "WARNING: HEADSCALE_AUTHKEY not set — the device will register with" >&2
+    echo "         ${HEADSCALE_URL} but wait for approval before the fallback" >&2
+    echo "         path works. Re-run with HEADSCALE_AUTHKEY exported for an" >&2
+    echo "         unattended join." >&2
+  fi
+  if HEADSCALE_URL="$HEADSCALE_URL" HEADSCALE_AUTHKEY="$HEADSCALE_AUTHKEY" \
+     CUSTOMER="$CUSTOMER" run_quiet bash "$MESH_DIR/aw-mesh-setup.sh"; then
+    MESH_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+    if [ -n "$MESH_IP" ]; then
+      ok "Private connection ready — this home is also reachable at http://${MESH_IP}:8889"
+    else
+      ok "Private connection installed — waiting to be approved by August West."
+    fi
+  else
+    echo "WARNING: the private fallback connection did not finish installing." >&2
+    echo "         See $LOG. Taking the home offline would have no remote way back." >&2
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -519,6 +732,69 @@ if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ZONE_ID" ]; then
       echo "WARNING: cloudflared rejected the edited ingress config; leaving tunnel as-is." >&2
     fi
   fi
+
+  # Ensure the customer dashboard's edge route exists too (dashboard-<domain> ->
+  # 127.0.0.1:8889). Same guarded injection as the setup route above, so an
+  # aw-tunnel-setup.sh that predates the dashboard still gets it.
+  if [ -f "$CF_CFG" ] && ! grep -q "dashboard-${CUSTOMER_DOMAIN}" "$CF_CFG"; then
+    echo "Adding dashboard-${CUSTOMER_DOMAIN} route to $CF_CFG ..." >> "$LOG"
+    tmp_cfg="$(mktemp)"
+    awk -v host="dashboard-${CUSTOMER_DOMAIN}" '
+      /- service: http_status:404/ && !done {
+        print "  - hostname: " host
+        print "    service: http://127.0.0.1:8889"
+        done=1
+      }
+      { print }
+    ' "$CF_CFG" > "$tmp_cfg" && mv "$tmp_cfg" "$CF_CFG"
+    if command -v cloudflared >/dev/null 2>&1 && cloudflared --config "$CF_CFG" tunnel ingress validate >> "$LOG" 2>&1; then
+      systemctl restart aw-cloudflared.service 2>/dev/null || systemctl restart cloudflared 2>/dev/null || true
+    else
+      echo "WARNING: cloudflared rejected the edited ingress config after adding the dashboard route; leaving tunnel as-is." >&2
+    fi
+  fi
+
+  # The dashboard's edge route is added ABOVE (to config.yml), but its public DNS
+  # record is NOT — aw-tunnel-setup.sh only knows about photos/vault/files/home/
+  # setup, so the dashboard-<customer_domain> CNAME never gets created there.
+  # Without it the hostname resolves to nothing and the tunnel route is dead.
+  # Create it here the same way aw-tunnel-setup.sh does for the other services:
+  # upsert a single proxied CNAME dashboard-<customer_domain> ->
+  # <tunnel-id>.cfargotunnel.com via the Cloudflare DNS API. Idempotent — reuse
+  # the existing record if present, otherwise create it.
+  DASH_HOST="dashboard-${CUSTOMER_DOMAIN}"
+  TUNNEL_ID="$(cat /etc/cloudflared/tunnel-id 2>/dev/null || true)"
+  if [ -n "$TUNNEL_ID" ]; then
+    echo "Creating DNS CNAME ${DASH_HOST} -> ${TUNNEL_ID}.cfargotunnel.com ..." >> "$LOG"
+    CF_API="https://api.cloudflare.com/client/v4"
+    cf_dns() {  # METHOD PATH [JSON_BODY] -> prints Cloudflare API response body
+      local method="$1" path="$2" body="${3:-}"
+      if [ -n "$body" ]; then
+        curl -sS -X "$method" "${CF_API}${path}" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}" \
+          -H "Content-Type: application/json" --data "$body"
+      else
+        curl -sS -X "$method" "${CF_API}${path}" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}"
+      fi
+    }
+    dash_target="${TUNNEL_ID}.cfargotunnel.com"
+    dash_rid="$(cf_dns GET "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${DASH_HOST}" \
+                  | jq -r '.result[0].id // empty' 2>/dev/null || true)"
+    dash_body="$(jq -nc --arg n "$DASH_HOST" --arg c "$dash_target" \
+                   '{type:"CNAME", name:$n, content:$c, proxied:true, ttl:1}')"
+    if [ -n "$dash_rid" ]; then
+      cf_dns PUT "/zones/${CF_ZONE_ID}/dns_records/${dash_rid}" "$dash_body" >> "$LOG" 2>&1 \
+        && echo "  CNAME ${DASH_HOST} -> ${dash_target} (updated)" >> "$LOG"
+    else
+      cf_dns POST "/zones/${CF_ZONE_ID}/dns_records" "$dash_body" >> "$LOG" 2>&1 \
+        && echo "  CNAME ${DASH_HOST} -> ${dash_target} (created)" >> "$LOG"
+    fi
+  else
+    echo "WARNING: /etc/cloudflared/tunnel-id not found — dashboard DNS record NOT created;" >&2
+    echo "         dashboard-${CUSTOMER_DOMAIN} will not resolve until the tunnel is set up." >&2
+  fi
+
   ok "Secure internet access configured."
 else
   note "Secure internet access not set up yet — your apps work locally for now."
@@ -784,6 +1060,54 @@ if [ -f "$ONBOARD_DIR/docker-compose.yml" ]; then
     qrencode -t ANSIUTF8 -m 2 "$SETUP_URL"
   else
     echo " (could not install qrencode — open the URL above to view the QR code)"
+  fi
+  echo "==============================================================="
+fi
+
+# ---------------------------------------------------------------------------
+# Step 9b — hand off the customer dashboard URL (deployed in Step 6c).
+#   No token in the URL: the dashboard is a login screen (August West master
+#   password). Printed alongside the setup wizard link above.
+# ---------------------------------------------------------------------------
+if [ -f "$DASH_DIR/docker-compose.yml" ]; then
+  DASHBOARD_URL="https://dashboard-${CUSTOMER_DOMAIN}/"
+  echo
+  echo "==============================================================="
+  echo " Your home dashboard"
+  echo "==============================================================="
+  echo " Add this to your phone's home screen to check on your home and take"
+  echo " it offline anytime. Sign in with your August West master password:"
+  echo
+  echo "   ${DASHBOARD_URL}"
+  echo
+  if [ "${TUNNEL_CONFIGURED:-false}" != true ]; then
+    echo " NOTE: the Cloudflare Tunnel is not configured yet, so this public URL"
+    echo "       will not resolve until it is. In the meantime reach it over"
+    echo "       Tailscale or an SSH tunnel:"
+    echo "         ssh -L 8889:127.0.0.1:8889 root@$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "       then open http://127.0.0.1:8889/"
+    echo
+  fi
+  # The way back in after "going dark" (Step 6d). Printed here because the
+  # customer needs it BEFORE they ever use the offline toggle -- the dashboard
+  # also shows it on its login screen and in the go-dark confirmation.
+  MESH_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+  if [ -n "$MESH_IP" ]; then
+    echo " Backup connection (works even when your home is offline):"
+    echo "   http://${MESH_IP}:8889"
+    echo "   Install the Tailscale app and sign in to ${HEADSCALE_URL} to use it."
+    echo
+  else
+    echo " NOTE: your backup connection is not approved yet, so for now the"
+    echo "       offline toggle can only be undone from this device. August West"
+    echo "       support finishes this from their side."
+    echo
+  fi
+  # qrencode was installed by the setup hand-off above when present; reuse it.
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -m 2 "$DASHBOARD_URL"
+  else
+    echo " (install qrencode to view a scannable QR code of this URL)"
   fi
   echo "==============================================================="
 fi

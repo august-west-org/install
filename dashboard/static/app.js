@@ -16,6 +16,24 @@ const LINK_PREFIX = {
 
 let token = localStorage.getItem(TOKEN_KEY);
 
+// Last known fallback ("backup connection") details from /api/mesh or
+// /api/status. The whole point of the toggle NOT being a one-way door: this
+// address reaches the dashboard over the private mesh while the Cloudflare
+// tunnel is off, so we surface it before, during and after going dark.
+let mesh = null;
+
+// True when this very page was loaded over the fallback path rather than the
+// public tunnel -- i.e. the customer is already using the way back in.
+function onMeshNow() {
+  const h = location.hostname;
+  if (!h) return false;
+  if (mesh && mesh.address && mesh.address.split(":")[0] === h) return true;
+  // 100.64.0.0/10 is the tailnet (CGNAT) range; recognise it even before
+  // /api/mesh has answered.
+  const m = h.match(/^100\.(\d+)\./);
+  return !!m && +m[1] >= 64 && +m[1] <= 127;
+}
+
 // Authoritative online/offline state, driven by the 5s /api/tunnel/state poll.
 // When the tunnel is down the home is dark: the toggle reads off, the dark
 // banner shows, and EVERY service tile reads Offline (they're only reachable
@@ -64,6 +82,35 @@ function brand() {
   </div>`;
 }
 
+/* -------------------------------------------------------- backup address ---- */
+// Shared copy for the login screen and the dashboard. Kept plain: the customer
+// reads this out to support, or types it into a browser, on their worst day.
+function meshBlock(m, opts = {}) {
+  if (!m || !m.configured) return "";
+  if (!m.available) {
+    return `<div class="mesh-box warn">
+      <div class="mesh-title">Backup connection</div>
+      <p class="hint">${escapeHtml(m.reason || "Not available right now.")}</p>
+    </div>`;
+  }
+  return `<div class="mesh-box">
+    <div class="mesh-title">Backup connection${opts.here ? " — you're on it" : ""}</div>
+    <p class="hint">${opts.here
+      ? "This page came in over your private August West connection, so it keeps working while your home is dark."
+      : "Works even when your home is offline. Connect with the Tailscale app, then open:"}</p>
+    <div class="mesh-addr" id="mesh-addr">${escapeHtml(m.url || ("http://" + m.address))}</div>
+    ${m.hostname ? `<p class="hint">Device name: <b>${escapeHtml(m.hostname)}</b></p>` : ""}
+  </div>`;
+}
+
+async function loadMesh() {
+  try {
+    const res = await fetch("/api/mesh");
+    if (res.ok) mesh = await res.json();
+  } catch (_) { /* offline / unreachable: leave the last known value */ }
+  return mesh;
+}
+
 /* ---------------------------------------------------------------- login ---- */
 function renderLogin(errMsg) {
   el("app").innerHTML = `
@@ -76,7 +123,16 @@ function renderLogin(errMsg) {
       <input type="password" id="pw" autocomplete="current-password" />
       <div id="login-error">${errMsg ? `<div class="error-box">${escapeHtml(errMsg)}</div>` : ""}</div>
       <button class="btn btn-primary" id="signin" style="margin-top:18px;">Sign in</button>
+      <div id="mesh-hint">${meshBlock(mesh, { here: onMeshNow() })}</div>
     </div>`;
+
+  // The address that still works when the tunnel is down belongs HERE, on the
+  // screen the customer can reach while everything is fine -- that is the only
+  // moment they can write it down. It needs no session to fetch.
+  loadMesh().then((m) => {
+    const slot = el("mesh-hint");
+    if (slot) slot.innerHTML = meshBlock(m, { here: onMeshNow() });
+  });
   const submit = async () => {
     const btn = el("signin");
     const pw = el("pw").value;
@@ -118,6 +174,7 @@ function backupText(backup) {
 function renderDashboard(status) {
   if (status) lastStatus = status;
   status = status || lastStatus;
+  if (status && status.mesh) mesh = status.mesh;
   // The tunnel poll is the single source of truth for online/offline.
   const online = tunnelOnline;
   const services = (status && status.services) || [];
@@ -152,6 +209,16 @@ function renderDashboard(status) {
     ? ""
     : `<p class="hint">Connection control isn't available on this device yet.</p>`;
 
+  // While dark, the backup address is the only way back in -- put it directly
+  // under the switch instead of making the customer hunt for it. Warn about a
+  // missing fallback BEFORE they go dark, not after.
+  const meshCard = (mesh && mesh.configured)
+    ? `<div class="card">${meshBlock(mesh, { here: onMeshNow() })}
+        ${online && mesh.available
+          ? `<p class="hint">Keep this address: it's how you turn your home back on while it's dark.</p>`
+          : ""}</div>`
+    : "";
+
   el("app").innerHTML = `
     ${brand()}
 
@@ -169,6 +236,8 @@ function renderDashboard(status) {
       ${darkBanner}
       ${controlNote}
     </div>
+
+    ${meshCard}
 
     <div class="card">
       <div class="section-title">Service status</div>
@@ -278,9 +347,18 @@ async function onToggle(currentlyOnline, controlAvailable) {
   const goingOffline = currentlyOnline; // toggling from online -> offline
 
   if (goingOffline) {
+    // Refresh the fallback status first: the customer is about to depend on it,
+    // and a stale "available" here is what a one-way door looks like.
+    await loadMesh();
+    let closing = mesh && mesh.available
+      ? `\n\nTo turn it back on you'll use your backup connection:\n${mesh.url || "http://" + mesh.address}` +
+        `\n\n(Open the Tailscale app on your phone first.)`
+      : `\n\nHEADS UP: your backup connection isn't working right now` +
+        `${mesh && mesh.reason ? " — " + mesh.reason : ""}\nUntil it is, the only way back on is from this device itself,` +
+        ` or by calling support at ${SUPPORT_EMAIL}.`;
     const ok = confirm(
       "Take your home offline?\n\nYour data goes dark — no one, anywhere, will be able to " +
-        "reach your photos, passwords, files, or smart home until you turn it back on."
+        "reach your photos, passwords, files, or smart home until you turn it back on." + closing
     );
     if (!ok) return;
   }
@@ -305,7 +383,7 @@ async function onToggle(currentlyOnline, controlAvailable) {
 
 /* --------------------------------------------------------------- bootstrap - */
 function start() {
-  if (token) renderDashboard();
+  if (token) { loadMesh(); renderDashboard(); }
   else renderLogin();
   // Periodic refresh while the app is open: services/backup every 20s, and the
   // tunnel online/offline state every 5s so "going dark" shows up promptly.

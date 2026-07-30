@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# August West mesh control -- host side.
+#
+# Owns the device's PERMANENT fallback path: the Tailscale client joined to the
+# August West Headscale coordinator. This path is deliberately independent of
+# the Cloudflare Tunnel -- when the customer taps "offline" on the dashboard,
+# aw-cloudflared stops and the home goes dark to the public internet, but this
+# connection stays up so the customer (or August West support) can still reach
+# the dashboard and turn the front door back on.
+#
+# Subcommands:
+#   ensure   self-heal: control transport up, tailscaled enabled+running, backend
+#            logged in, tailnet-side dashboard listener bound to the current IP.
+#   refresh  publish the observed mesh state to $STATE for the dashboard to read.
+#   join     first-time (or re-)registration with Headscale.
+#   reprobe  re-test how the coordinator's control protocol is reachable and
+#            switch transports (direct <-> local websocket bridge) accordingly.
+#   status   human-readable summary (operator/support use).
+#
+# The dashboard container never runs this -- it only READS $STATE. Host root
+# stays out of the container, exactly like the tunnel spool in aw-tunnel-ctl.
+set -uo pipefail
+
+HEADSCALE_URL_DEFAULT=https://headscale.augustwest.org
+BRIDGE_URL=http://127.0.0.1:8990
+SPOOL=/etc/augustwest/mesh
+STATE="$SPOOL/state"
+CONF="$SPOOL/mesh.env"          # HEADSCALE_URL / LOGIN_SERVER / USE_BRIDGE / MESH_HOSTNAME / AUTHKEY (0600)
+DASH_PORT=8889
+SOCKET_UNIT=aw-dashboard-mesh.socket
+BRIDGE_UNIT=aw-mesh-bridge.service
+SOCKET_DROPIN_DIR=/etc/systemd/system/${SOCKET_UNIT}.d
+SOCKET_DROPIN="$SOCKET_DROPIN_DIR/10-tailnet-address.conf"
+
+mkdir -p "$SPOOL"
+chmod 755 "$SPOOL" 2>/dev/null || true
+
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+HEADSCALE_URL="${HEADSCALE_URL:-$HEADSCALE_URL_DEFAULT}"
+USE_BRIDGE="${USE_BRIDGE:-false}"
+LOGIN_SERVER="${LOGIN_SERVER:-$HEADSCALE_URL}"
+MESH_HOSTNAME="${MESH_HOSTNAME:-$(hostname)}"
+AUTHKEY="${AUTHKEY:-}"
+
+log() { printf '[aw-mesh] %s\n' "$*"; }
+
+backend() { tailscale status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([^"]*\)".*/\1/p' | head -n1; }
+ip4()     { tailscale ip -4 2>/dev/null | head -n1; }
+ip6()     { tailscale ip -6 2>/dev/null | head -n1; }
+dnsname() { tailscale status --json 2>/dev/null | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get("Self") or {}).get("DNSName", "").rstrip("."))
+except Exception:
+    pass' 2>/dev/null; }
+
+# --------------------------------------------------------------------------
+# Transport selection.
+#   A stock Tailscale client opens its control session with
+#   `Upgrade: tailscale-control-protocol`. A coordinator published through a
+#   Cloudflare Tunnel never sees that header (the edge forwards only
+#   `Upgrade: websocket`) and answers 500, so the client can never register.
+#   Probe for it: a coordinator we can talk to directly answers 101.
+#   If it cannot, we route the client through the local websocket bridge.
+#
+#   This is why the bridge retires itself: once the coordinator is published
+#   directly, `aw-mesh-ctl reprobe` finds 101 and points the client straight at
+#   it, no reinstall needed.
+# --------------------------------------------------------------------------
+probe_direct_control() {
+  local code
+  code="$(curl -sS -o /dev/null -m 15 -w '%{http_code}' --http1.1 \
+    -H 'Connection: Upgrade' -H 'Upgrade: tailscale-control-protocol' \
+    -H 'X-Tailscale-Handshake: cHJvYmU=' "$HEADSCALE_URL/ts2021" 2>/dev/null)"
+  [ "$code" = 101 ]
+}
+
+write_conf() {
+  local tmp="$CONF.tmp"
+  ( umask 077
+    {
+      printf 'HEADSCALE_URL=%s\n' "$HEADSCALE_URL"
+      printf 'LOGIN_SERVER=%s\n'  "$LOGIN_SERVER"
+      printf 'USE_BRIDGE=%s\n'    "$USE_BRIDGE"
+      printf 'MESH_HOSTNAME=%s\n' "$MESH_HOSTNAME"
+      [ -n "$AUTHKEY" ] && printf 'AUTHKEY=%s\n' "$AUTHKEY"
+    } > "$tmp" )
+  chmod 600 "$tmp"; mv -f "$tmp" "$CONF"
+}
+
+cmd_reprobe() {
+  local before="$LOGIN_SERVER"
+  if probe_direct_control; then
+    log "coordinator accepts the control protocol directly -- bridge not needed"
+    USE_BRIDGE=false; LOGIN_SERVER="$HEADSCALE_URL"
+  else
+    log "coordinator strips the control-protocol upgrade -- using the local websocket bridge"
+    USE_BRIDGE=true;  LOGIN_SERVER="$BRIDGE_URL"
+  fi
+  write_conf
+  ensure_bridge
+  if [ "$before" != "$LOGIN_SERVER" ] && [ -n "$before" ]; then
+    log "control transport changed: $before -> $LOGIN_SERVER (re-pointing the client)"
+    tailscale set --login-server "$LOGIN_SERVER" >/dev/null 2>&1 \
+      || tailscale up --login-server "$LOGIN_SERVER" --hostname "$MESH_HOSTNAME" \
+           --accept-dns=false --accept-routes=false ${AUTHKEY:+--auth-key "$AUTHKEY"} \
+           --timeout 30s >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_bridge() {
+  systemctl list-unit-files "$BRIDGE_UNIT" >/dev/null 2>&1 || return 0
+  if [ "$USE_BRIDGE" = true ]; then
+    systemctl is-enabled --quiet "$BRIDGE_UNIT" 2>/dev/null || systemctl enable "$BRIDGE_UNIT" >/dev/null 2>&1
+    systemctl is-active  --quiet "$BRIDGE_UNIT" 2>/dev/null || {
+      log "control bridge was not running -- starting"; systemctl start "$BRIDGE_UNIT" >/dev/null 2>&1; sleep 1; }
+  else
+    systemctl disable --now "$BRIDGE_UNIT" >/dev/null 2>&1 || true
+  fi
+}
+
+# --------------------------------------------------------------------------
+# join -- register this device with Headscale.
+#   With AUTHKEY (an August West OPERATOR credential, pre-auth key minted on the
+#   coordinator) this is fully unattended. Without one we still bring the client
+#   up and print the registration URL for support to approve, rather than
+#   failing: the client keeps retrying, so the fallback path completes the moment
+#   the node is approved.
+# --------------------------------------------------------------------------
+cmd_join() {
+  command -v tailscale >/dev/null 2>&1 || { log "tailscale is not installed"; return 1; }
+  ensure_bridge
+  systemctl enable --now tailscaled >/dev/null 2>&1
+
+  local args=(--login-server "$LOGIN_SERVER" --hostname "$MESH_HOSTNAME"
+              --accept-dns=false --accept-routes=false --reset)
+  if [ -n "$AUTHKEY" ]; then
+    log "registering with $HEADSCALE_URL as $MESH_HOSTNAME (pre-auth key)"
+    tailscale up "${args[@]}" --auth-key "$AUTHKEY" || {
+      log "registration with the supplied pre-auth key failed"; return 1; }
+  else
+    log "no pre-auth key: starting interactive registration with $HEADSCALE_URL"
+    # --timeout keeps the installer from blocking forever; tailscaled goes on
+    # retrying in the background after we return.
+    tailscale up "${args[@]}" --timeout 45s 2>&1 | sed 's/^/[aw-mesh] /'
+  fi
+
+  cmd_ensure
+  [ "$(backend)" = Running ]
+}
+
+# --------------------------------------------------------------------------
+# ensure -- the "always on" guarantee.
+#   Runs on a 60s timer AND after every tunnel toggle. Nothing in the product is
+#   allowed to leave this path down: if a unit was stopped or disabled, or the
+#   backend fell out of Running with a usable key on disk, we bring it back.
+# --------------------------------------------------------------------------
+cmd_ensure() {
+  command -v tailscale >/dev/null 2>&1 || return 0
+  ensure_bridge
+
+  systemctl is-enabled --quiet tailscaled 2>/dev/null || {
+    log "tailscaled was not enabled -- enabling"; systemctl enable tailscaled >/dev/null 2>&1; }
+  systemctl is-active --quiet tailscaled 2>/dev/null || {
+    log "tailscaled was not running -- starting"; systemctl start tailscaled >/dev/null 2>&1; sleep 2; }
+
+  local st; st="$(backend)"
+  case "$st" in
+    Running) ;;
+    Stopped)
+      log "backend Stopped -- bringing the tailnet link back up"
+      tailscale up --login-server "$LOGIN_SERVER" >/dev/null 2>&1 || true ;;
+    NeedsLogin|NoState|"")
+      if [ -n "$AUTHKEY" ]; then
+        log "backend ${st:-unknown} -- re-registering with the stored pre-auth key"
+        tailscale up --login-server "$LOGIN_SERVER" --hostname "$MESH_HOSTNAME" \
+          --accept-dns=false --accept-routes=false --auth-key "$AUTHKEY" \
+          --timeout 30s >/dev/null 2>&1 || true
+      else
+        log "backend ${st:-unknown} and no pre-auth key on disk -- node still awaiting approval"
+      fi ;;
+  esac
+
+  sync_socket
+  cmd_refresh
+}
+
+# Keep the tailnet-side dashboard listener bound to whatever tailnet address we
+# currently hold. Binding the SPECIFIC tailnet IP (never 0.0.0.0) is what makes
+# this listener reachable from the tailnet only -- same safe-by-default rule the
+# rest of the stack follows with 127.0.0.1.
+sync_socket() {
+  systemctl list-unit-files "$SOCKET_UNIT" >/dev/null 2>&1 || return 0
+  local v4 v6 want
+  v4="$(ip4)"; v6="$(ip6)"
+
+  # No tailnet address (not registered yet, logged out, node removed) -> there is
+  # nothing legitimate to serve. Tear the listener down rather than leave it bound
+  # to an address this device no longer holds: FreeBind lets such a bind survive
+  # the address disappearing, and a stale listener would report the fallback as
+  # working when it is not.
+  if [ -z "$v4" ]; then
+    if [ -e "$SOCKET_DROPIN" ]; then
+      log "no tailnet address -- removing the stale dashboard listener binding"
+      rm -f "$SOCKET_DROPIN"
+      systemctl daemon-reload
+    fi
+    systemctl stop "$SOCKET_UNIT" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  want="[Socket]
+ListenStream=${v4}:${DASH_PORT}"
+  [ -n "$v6" ] && want="${want}
+ListenStream=[${v6}]:${DASH_PORT}"
+
+  mkdir -p "$SOCKET_DROPIN_DIR"
+  if [ "$(cat "$SOCKET_DROPIN" 2>/dev/null)" != "$want" ]; then
+    log "tailnet address is ${v4} -- (re)binding the dashboard listener"
+    printf '%s\n' "$want" > "$SOCKET_DROPIN"
+    chmod 644 "$SOCKET_DROPIN"
+    systemctl daemon-reload
+    systemctl restart "$SOCKET_UNIT" >/dev/null 2>&1 || true
+  fi
+  systemctl is-active --quiet "$SOCKET_UNIT" 2>/dev/null \
+    || systemctl start "$SOCKET_UNIT" >/dev/null 2>&1 || true
+}
+
+# --------------------------------------------------------------------------
+# refresh -- publish state for the dashboard (read-only consumer).
+# --------------------------------------------------------------------------
+cmd_refresh() {
+  local st v4 v6 dns active listener bridge url transport
+  st="$(backend)"; st="${st:-unknown}"
+  v4="$(ip4)"; v6="$(ip6)"; dns="$(dnsname)"
+  systemctl is-active --quiet tailscaled 2>/dev/null && active=true || active=false
+  systemctl is-active --quiet "$SOCKET_UNIT" 2>/dev/null && listener=true || listener=false
+  systemctl is-active --quiet "$BRIDGE_UNIT" 2>/dev/null && bridge=true || bridge=false
+  [ "$USE_BRIDGE" = true ] && transport=websocket-bridge || transport=direct
+  url=""; [ -n "$v4" ] && url="http://${v4}:${DASH_PORT}"
+
+  local tmp="$STATE.tmp"
+  cat > "$tmp" <<EOF
+{
+  "backend": "$st",
+  "ipv4": "$v4",
+  "ipv6": "$v6",
+  "dns_name": "$dns",
+  "hostname": "$MESH_HOSTNAME",
+  "coordinator": "$HEADSCALE_URL",
+  "control_transport": "$transport",
+  "dashboard_url": "$url",
+  "service_active": $active,
+  "listener_active": $listener,
+  "bridge_active": $bridge,
+  "updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+  mv -f "$tmp" "$STATE"
+  chmod 644 "$STATE" 2>/dev/null || true
+}
+
+cmd_status() {
+  echo "coordinator  : $HEADSCALE_URL"
+  echo "login server : $LOGIN_SERVER  (transport: $([ "$USE_BRIDGE" = true ] && echo 'local websocket bridge' || echo direct))"
+  echo "hostname     : $MESH_HOSTNAME"
+  echo "bridge       : $(systemctl is-active $BRIDGE_UNIT 2>/dev/null)"
+  echo "tailscaled   : $(systemctl is-active tailscaled 2>/dev/null) / $(systemctl is-enabled tailscaled 2>/dev/null)"
+  echo "backend      : $(backend)"
+  echo "tailnet IPv4 : $(ip4)"
+  echo "tailnet IPv6 : $(ip6)"
+  echo "dns name     : $(dnsname)"
+  echo "dashboard    : http://$(ip4):$DASH_PORT  (listener: $(systemctl is-active $SOCKET_UNIT 2>/dev/null))"
+  echo "cloudflared  : $(systemctl is-active aw-cloudflared.service 2>/dev/null)  <- independent of the above"
+}
+
+case "${1:-}" in
+  join)    cmd_join ;;
+  ensure)  cmd_ensure ;;
+  refresh) cmd_refresh ;;
+  reprobe) cmd_reprobe; cmd_ensure ;;
+  status)  cmd_status ;;
+  *) echo "usage: aw-mesh-ctl {join|ensure|refresh|reprobe|status}" >&2; exit 2 ;;
+esac

@@ -4,7 +4,9 @@
  * when the phone is offline (it will show the last data and a reconnect note).
  * API calls (/api/*) and non-GET requests always go to the network -- we never
  * cache status, logins, or toggles. */
-const CACHE = "aw-dashboard-v1";
+// Bump on every shell change: v2 adds the backup-connection (fallback mesh)
+// address to the login screen and dashboard, so a phone holding v1 must refetch.
+const CACHE = "aw-dashboard-v2";
 const SHELL = [
   "/",
   "/static/style.css",

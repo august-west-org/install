@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep the August West fallback mesh up and publish its state
+# Deliberately NO relationship to aw-cloudflared.service: the fallback path must
+# survive the customer taking the home dark.
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aw-mesh-ctl ensure

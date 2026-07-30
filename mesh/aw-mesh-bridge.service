@@ -1,0 +1,27 @@
+[Unit]
+Description=August West mesh control bridge (websocket transport to Headscale)
+Documentation=file:/opt/augustwest/mesh/README.md
+After=network-online.target
+Wants=network-online.target
+# Ordered BEFORE tailscaled so the control transport exists when the client
+# first dials it. Deliberately unrelated to aw-cloudflared.service: this is part
+# of the path that must survive the customer taking the home dark.
+Before=tailscaled.service
+
+[Service]
+ExecStart=/usr/local/bin/aw-mesh-bridge
+EnvironmentFile=-/etc/augustwest/mesh/bridge.env
+Restart=always
+RestartSec=2
+# Loopback-only listener; carries an already-encrypted Noise session and holds
+# no keys of its own, so it needs no privileges at all.
+DynamicUser=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
